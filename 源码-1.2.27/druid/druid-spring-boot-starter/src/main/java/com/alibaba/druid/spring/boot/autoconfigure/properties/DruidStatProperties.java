@@ -20,10 +20,17 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 /**
  * @author lihengming [89921218@qq.com]
  */
+// Druid监控和统计功能配置类
 @ConfigurationProperties("spring.datasource.druid")
 public class DruidStatProperties {
+
+    // Spring AOP 切入点模式
     private String[] aopPatterns;
+
+    // 监控页面 Servlet 配置
     private StatViewServlet statViewServlet = new StatViewServlet();
+
+    // Web 统计过滤器配置
     private WebStatFilter webStatFilter = new WebStatFilter();
 
     public String[] getAopPatterns() {
@@ -50,17 +57,18 @@ public class DruidStatProperties {
         this.webStatFilter = webStatFilter;
     }
 
+    // 监控页面 Servlet 配置
     public static class StatViewServlet {
         /**
          * Enable StatViewServlet, default false.
          */
-        private boolean enabled;
-        private String urlPattern;
-        private String allow;
-        private String deny;
-        private String loginUsername;
-        private String loginPassword;
-        private String resetEnable;
+        private boolean enabled;          // 是否启用，默认 false
+        private String urlPattern;        // URL 模式
+        private String allow;             // 允许访问的IP白名单
+        private String deny;              // 拒绝访问的IP黑名单
+        private String loginUsername;     // 登录用户名
+        private String loginPassword;     // 登录密码
+        private String resetEnable;       // 是否允许重置统计信息
 
         public boolean isEnabled() {
             return enabled;
@@ -119,18 +127,19 @@ public class DruidStatProperties {
         }
     }
 
+    // Web 统计过滤器配置
     public static class WebStatFilter {
         /**
          * Enable WebStatFilter, default false.
          */
-        private boolean enabled;
-        private String urlPattern;
-        private String exclusions;
-        private String sessionStatMaxCount;
-        private String sessionStatEnable;
-        private String principalSessionName;
-        private String principalCookieName;
-        private String profileEnable;
+        private boolean enabled;                   // 是否启用
+        private String urlPattern;                 // URL 模式
+        private String exclusions;                 // 排除路径
+        private String sessionStatMaxCount;        // Session统计最大数量
+        private String sessionStatEnable;          // 是否启用Session统计
+        private String principalSessionName;       // Principal Session名称
+        private String principalCookieName;        // Principal Cookie名称
+        private String profileEnable;              // 是否启用性能分析
 
         public boolean isEnabled() {
             return enabled;

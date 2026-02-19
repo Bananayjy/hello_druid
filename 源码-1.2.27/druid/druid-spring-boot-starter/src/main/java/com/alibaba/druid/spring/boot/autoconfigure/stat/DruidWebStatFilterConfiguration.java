@@ -25,9 +25,20 @@ import org.springframework.context.annotation.Bean;
 /**
  * @author lihengming [89921218@qq.com]
  */
+
+/**
+ * Web 请求统计 Filter
+ * 作用：注册 WebStatFilter，对 HTTP 请求做统计（URI、Session、请求次数等），并在 Druid 监控页的「Web 应用」等维度展示
+ */
+// Web 应用 且 spring.datasource.druid.web-stat-filter.enabled=true 时生效
 @ConditionalOnWebApplication
 @ConditionalOnProperty(name = "spring.datasource.druid.web-stat-filter.enabled", havingValue = "true")
 public class DruidWebStatFilterConfiguration {
+    /**
+     * 注册 Web 请求统计 Filter
+     * @param properties Druid监控和统计功能配置类
+     * @return Filter注册Bean
+     */
     @Bean
     public FilterRegistrationBean webStatFilterRegistrationBean(DruidStatProperties properties) {
         DruidStatProperties.WebStatFilter config = properties.getWebStatFilter();

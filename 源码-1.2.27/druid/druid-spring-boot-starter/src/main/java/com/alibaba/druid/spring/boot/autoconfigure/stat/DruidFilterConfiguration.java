@@ -32,6 +32,12 @@ import org.springframework.context.annotation.Bean;
 /**
  * @author lihengming [89921218@qq.com]
  */
+
+/**
+ * 各类 Druid Filter
+ * 作用：按配置按需注册多种 Druid 内置 Filter（及 Wall 配置），并绑定到 spring.datasource.druid.filter.* 下的属性；
+ * 这些 Filter 会通过 DruidDataSourceWrapper#autoAddFilters(List<Filter>) 注入到数据源，参与 SQL 执行链。
+ */
 public class DruidFilterConfiguration {
     @Bean
     @ConfigurationProperties(FILTER_STAT_PREFIX)
