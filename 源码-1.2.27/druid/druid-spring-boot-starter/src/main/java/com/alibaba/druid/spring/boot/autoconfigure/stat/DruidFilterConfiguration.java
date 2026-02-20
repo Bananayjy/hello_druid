@@ -35,10 +35,18 @@ import org.springframework.context.annotation.Bean;
 
 /**
  * 各类 Druid Filter
- * 作用：按配置按需注册多种 Druid 内置 Filter（及 Wall 配置），并绑定到 spring.datasource.druid.filter.* 下的属性；
- * 这些 Filter 会通过 DruidDataSourceWrapper#autoAddFilters(List<Filter>) 注入到数据源，参与 SQL 执行链。
+ * 作用：在 Spring Boot 中按需注册 Druid 的各种内置 Filter（及 Wall 的 WallConfig），并把 spring.datasource.druid.filter.* 的配置绑定到对应 Bean 上。
+ * 这些 Filter 会通过 DruidDataSourceWrapper#autoAddFilters(List<Filter>) 注入到 filters 链中，在执行 SQL 时依次经过这些 Filter（统计、日志、防注入等）。
+ * 说明：本类是通过 DruidDataSourceAutoConfigure 的 @Import(DruidFilterConfiguration.class) 引入的，被当作「带 @Bean 的配置类」使用，等价于配置类
  */
 public class DruidFilterConfiguration {
+
+    /**
+     * SQL 执行统计
+     * 作用：在连接池层对 SQL 执行做统计（执行次数、耗时、慢 SQL 等），供 Druid 监控页「SQL 统计」使用。
+     * 生效条件：spring.datasource.druid.filter.stat.enabled 为 true，且容器中不存在 StatFilter Bean。
+     * @return
+     */
     @Bean
     @ConfigurationProperties(FILTER_STAT_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_STAT_PREFIX, name = "enabled")
@@ -47,6 +55,12 @@ public class DruidFilterConfiguration {
         return new StatFilter();
     }
 
+    /**
+     * 配置中心
+     * 作用：从外部配置源（如配置中心、远程）加载/刷新配置，用于动态配置场景。
+     * 生效条件：spring.datasource.druid.filter.config.enabled=true 且无已有 ConfigFilter。
+     * @return
+     */
     @Bean
     @ConfigurationProperties(FILTER_CONFIG_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_CONFIG_PREFIX, name = "enabled")
@@ -55,6 +69,12 @@ public class DruidFilterConfiguration {
         return new ConfigFilter();
     }
 
+    /**
+     * 编解码
+     * 作用：对请求/响应做编码转换（如字符集、加解密），用于特殊编码或兼容场景。
+     * 生效条件：spring.datasource.druid.filter.encoding.enabled=true 且无已有 EncodingConvertFilter。
+     * @return
+     */
     @Bean
     @ConfigurationProperties(FILTER_ENCODING_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_ENCODING_PREFIX, name = "enabled")
@@ -63,6 +83,12 @@ public class DruidFilterConfiguration {
         return new EncodingConvertFilter();
     }
 
+    /**
+     * 日志类 Filter（Slf4j / Log4j / Log4j2 / Commons-Log）
+     * 作用：用对应日志框架输出 SQL 相关日志（如 SQL 文本、参数、执行时间）。
+     * 生效条件：各自前缀下 enabled=true，且容器中不存在同类型 Bean。
+     * @return
+     */
     @Bean
     @ConfigurationProperties(FILTER_SLF4J_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_SLF4J_PREFIX, name = "enabled")
@@ -70,7 +96,6 @@ public class DruidFilterConfiguration {
     public Slf4jLogFilter slf4jLogFilter() {
         return new Slf4jLogFilter();
     }
-
     @Bean
     @ConfigurationProperties(FILTER_LOG4J_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_LOG4J_PREFIX, name = "enabled")
@@ -78,7 +103,6 @@ public class DruidFilterConfiguration {
     public Log4jFilter log4jFilter() {
         return new Log4jFilter();
     }
-
     @Bean
     @ConfigurationProperties(FILTER_LOG4J2_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_LOG4J2_PREFIX, name = "enabled")
@@ -86,7 +110,6 @@ public class DruidFilterConfiguration {
     public Log4j2Filter log4j2Filter() {
         return new Log4j2Filter();
     }
-
     @Bean
     @ConfigurationProperties(FILTER_COMMONS_LOG_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_COMMONS_LOG_PREFIX, name = "enabled")
@@ -95,6 +118,13 @@ public class DruidFilterConfiguration {
         return new CommonsLogFilter();
     }
 
+    /**
+     * WallConfig + WallFilter — SQL 防注入
+     * WallConfig：防注入规则配置（如是否允许多语句、允许的语法等）
+     * WallFilter：真正执行校验的 Filter，依赖 WallConfig
+     * 生效条件：两者都依赖 spring.datasource.druid.filter.wall.enabled=true；且各自 @ConditionalOnMissingBean。
+     * @return
+     */
     @Bean
     @ConfigurationProperties(FILTER_WALL_CONFIG_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_WALL_PREFIX, name = "enabled")
@@ -102,7 +132,6 @@ public class DruidFilterConfiguration {
     public WallConfig wallConfig() {
         return new WallConfig();
     }
-
     @Bean
     @ConfigurationProperties(FILTER_WALL_PREFIX)
     @ConditionalOnProperty(prefix = FILTER_WALL_PREFIX, name = "enabled")
@@ -113,6 +142,10 @@ public class DruidFilterConfiguration {
         return filter;
     }
 
+    /**
+     * 类内常量：配置前缀
+     * 每个 Bean 的「是否启用」和「属性绑定」都基于这些前缀，对应 YAML 里 spring.datasource.druid.filter.<name>.*
+     */
     private static final String FILTER_STAT_PREFIX = "spring.datasource.druid.filter.stat";
     private static final String FILTER_CONFIG_PREFIX = "spring.datasource.druid.filter.config";
     private static final String FILTER_ENCODING_PREFIX = "spring.datasource.druid.filter.encoding";
