@@ -60,6 +60,33 @@ import static com.alibaba.druid.util.JdbcConstants.POSTGRESQL_DRIVER;
  * @author wenshao [szujobs@hotmail.com]
  * @author ljw [ljw2083@alibaba-inc.com]
  */
+
+/**
+ *
+ * DruidAbstractDataSource 是连接池抽象基类，
+ * 1.概述
+ * 是「连接池 + 配置 + Filter 链 + 物理连接创建 + 统计/JMX 能力」的抽象基类；具体池逻辑（取连接、回收、队列、线程）在子类 DruidDataSource 中
+ *
+ * 2.作用
+ * 维护 url/username/password、池参数（initialSize、maxActive、minIdle 等）、filters、init()/close() 等
+ *
+ * 3.继承&实现：
+ * 继承（extends） WrapperAdapter：实现 JDBC Wrapper，对 DataSource 的 isWrapperFor/unwrap 做默认实现
+ * 实现（implements） DataSource：标准 JDBC 数据源接口（getConnection() 在子类 DruidDataSource 中实现）
+ * 实现（implements） DataSourceProxy：代理数据源，对外暴露 getDataSourceStat()、getDataSourceId() 等，供 Filter/监控使用（具体在 DruidDataSource 实现）
+ * 实现（implements） DataSourceMonitorable：可被监控的数据源：重置统计、JMX、连接信息等（与 DruidDataSourceStatManager 配合）
+ * 实现（implements） DruidAbstractDataSourceMBean：DruidAbstractDataSourceMBean：MBean 暴露池参数、统计等，供 JMX 管理。
+ * 实现（implements） Serializable：支持序列化（实际使用中一般不建议序列化带连接的 DataSource）
+ *
+ * 4.核心功能
+ * 连接相关配置：url、username、password、driver、connectProperties、超时等
+ * 池参数：initialSize、maxActive、minIdle、maxIdle、maxWait 等
+ * 连接校验与保活：validationQuery、testOnBorrow/Return/WhileIdle、eviction 相关时间、removeAbandoned 等
+ * Filter 链：维护 filters 列表，创建/回收 FilterChainImpl，在创建物理连接时走 Filter
+ * 物理连接创建：createPhysicalConnection() 组装 Properties、调用 createPhysicalConnection(url, info)，并做 init、initSqls、validate、networkTimeout 等
+ * 统计与错误：执行次数、事务次数、PreparedStatement 缓存命中、最后错误等，并为 JMX/监控提供数据（具体 JdbcDataSourceStat 在子类）
+ * 抽象扩展点：recycle、handleConnectionException、logTransaction、setMaxActive、setConnectProperties、setPoolPreparedStatements 等由子类实现
+ */
 public abstract class DruidAbstractDataSource extends WrapperAdapter implements DruidAbstractDataSourceMBean, DataSource,
     DataSourceProxy, Serializable, DataSourceMonitorable {
     private static final long serialVersionUID = 1L;
