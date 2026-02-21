@@ -692,11 +692,46 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 记录当前线程的调用栈，用于监控/排查“是谁触发了 init”（例如 DataSourceMonitorable.getInitStackTrace()）
             initStackTrace = Utils.toString(Thread.currentThread().getStackTrace());
 
-            // 全局唯一的数据源 ID通过调用DruidDriver的createDataSourceId方法分配
-            // 从全局自增计数器里为当前数据源分配一个唯一 id（第 1 个数据源=1，第 2 个=2，…）
+
+            /**
+             * 全局唯一的数据源 ID通过调用DruidDriver的createDataSourceId方法分配
+             * 从全局自增计数器里为当前数据源分配一个唯一 id（第 1 个数据源=1，第 2 个=2，…），用于标识不同的数据源实例
+             */
             this.id = DruidDriver.createDataSourceId();
-            // 对 connection/statement/resultSet/transaction 的 ID 种子做偏移（(id-1)*100000），这样多数据源时各数据源产生的 ID 区间错开，便于区分和排查
+            /**
+             * 对 connection/statement/resultSet/transaction 的 ID 种子做偏移（(id-1)*100000），这样多数据源时各数据源产生的 ID 区间错开，便于区分和排查
+             *
+             * 1.作用：
+             * 快速定位来源：通过 ID 范围即可判断来自哪个数据源
+             * 避免 ID 冲突：不同数据源产生的 ID 不会重叠
+             * 便于日志分析：日志中看到 ID 即可知道是哪个数据源
+             * 监控友好：监控系统可按 ID 范围区分不同数据源
+             * 排查效率：问题排查时能快速定位到具体数据源
+             *
+             * 2.为什么选择 100000 作为间隔：
+             * 足够大：为每个数据源预留足够空间（10 万）
+             * 计算简单：(id-1) * 100000 易于理解和维护
+             * 实用：单个数据源很难在短时间内产生超过 10 万个对象
+             *
+             * 3.各数据源的 ID 区间分布示例：
+             * 数据源 1 (id=1)：不偏移
+             * Connection: 10000, 10001, 10002...
+             * Statement: 20000, 20001, 20002...
+             * ResultSet: 50000, 50001, 50002...
+             * Transaction: 60000, 60001, 60002...
+             * 数据源 2 (id=2)：偏移 100000
+             * Connection: 110000, 110001, 110002...
+             * Statement: 120000, 120001, 120002...
+             * ResultSet: 150000, 150001, 150002...
+             * Transaction: 160000, 160001, 160002...
+             * 数据源 3 (id=3)：偏移 200000
+             * Connection: 210000, 210001, 210002...
+             * Statement: 220000, 220001, 220002...
+             * ResultSet: 250000, 250001, 250002...
+             * Transaction: 260000, 260001, 260002...
+             */
             if (this.id > 1) {
+                // 偏移量计算
                 long delta = (this.id - 1) * 100000;
                 connectionIdSeedUpdater.addAndGet(this, delta);
                 statementIdSeedUpdater.addAndGet(this, delta);
@@ -704,7 +739,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                 transactionIdSeedUpdater.addAndGet(this, delta);
             }
 
-            // jdbcUrl解析
+            // jdbcUrl 处理与超时参数设置
             if (this.jdbcUrl != null) {
                 // 去掉首尾空格
                 this.jdbcUrl = this.jdbcUrl.trim();
@@ -714,9 +749,9 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 从 jdbcUrl 的 query 参数或 connectProperties 里解析 connectTimeout、socketTimeout，并调用对应的 setter，保证建连/读超时被正确设置
             initTimeoutsFromUrlOrProperties();
 
-            //  Filter 初始化
-            // 对已加入的每个 Filter 调用 filter.init(this)，把当前 DataSource 传给 Filter，让 Filter 做自己的初始化（如加载配置、注册统计等）
+            // Filter 初始化
             for (Filter filter : filters) {
+                // 对已加入的每个 Filter 调用 filter.init(this)，把当前 DataSource 传给 Filter，让 Filter 做自己的初始化（如加载配置、注册统计等）
                 filter.init(this);
             }
 
@@ -726,15 +761,22 @@ public class DruidDataSource extends DruidAbstractDataSource
                 this.dbTypeName = JdbcUtils.getDbType(jdbcUrl, null);
             }
 
-            // 若 URL 或 connectProperties 里已经带了 cacheServerConfiguration，则显式在 connectProperties 里设为 "true"，保证 MySQL 驱动使用服务端配置缓存，避免重复查询
+            /**
+             * MySQL 驱动使用服务端配置缓存
+             * cacheServerConfiguration 的作用：
+             * 缓存 MySQL 服务端配置信息（如 SHOW VARIABLES、SHOW COLLATION 的结果）
+             * 避免每次建立连接时重复查询，提升连接初始化性能
+             * 在连接池场景下，效果更明显
+             */
             DbType dbType = DbType.of(this.dbTypeName);
-            if (JdbcUtils.isMysqlDbType(dbType)) {
+            if (JdbcUtils.isMysqlDbType(dbType)) {  // 仅对 MySQL 系列数据库（MySQL、MariaDB、OceanBase、ADS 等）生效
                 boolean cacheServerConfigurationSet = false;
-                if (this.connectProperties.containsKey("cacheServerConfiguration")) {
+                if (this.connectProperties.containsKey("cacheServerConfiguration")) {   // connectProperties 中是否包含该参数
                     cacheServerConfigurationSet = true;
-                } else if (this.jdbcUrl.indexOf("cacheServerConfiguration") != -1) {
+                } else if (this.jdbcUrl.indexOf("cacheServerConfiguration") != -1) {    // JDBC URL 中是否包含该参数（如 jdbc:mysql://localhost:3306/db?cacheServerConfiguration=true）
                     cacheServerConfigurationSet = true;
                 }
+                // 显式设置参数值
                 if (cacheServerConfigurationSet) {
                     this.connectProperties.put("cacheServerConfiguration", "true");
                 }
@@ -744,49 +786,46 @@ public class DruidDataSource extends DruidAbstractDataSource
             if (maxActive <= 0) {
                 throw new IllegalArgumentException("illegal maxActive " + maxActive);
             }
-
             if (maxActive < minIdle) {
                 throw new IllegalArgumentException("illegal maxActive " + maxActive);
             }
-
             if (getInitialSize() > maxActive) {
                 throw new IllegalArgumentException("illegal initialSize " + this.initialSize + ", maxActive " + maxActive);
             }
-
             if (timeBetweenLogStatsMillis > 0 && useGlobalDataSourceStat) {
                 throw new IllegalArgumentException("timeBetweenLogStatsMillis not support useGlobalDataSourceStat=true");
             }
-
             if (maxEvictableIdleTimeMillis < minEvictableIdleTimeMillis) {
                 throw new SQLException("maxEvictableIdleTimeMillis must be grater than minEvictableIdleTimeMillis");
             }
-
             if (keepAlive && keepAliveBetweenTimeMillis <= timeBetweenEvictionRunsMillis) {
                 throw new SQLException("keepAliveBetweenTimeMillis must be greater than timeBetweenEvictionRunsMillis");
             }
 
+            // 驱动加载
             // driverClass 驱动类去除首尾空格。
             if (this.driverClass != null) {
                 this.driverClass = driverClass.trim();
             }
-
             // 通过 Java SPI 扫描并加载在 META-INF/services 里声明的 Filter 等扩展，并可能加入 filters
             initFromSPIServiceLoader();
-
             // 根据 driverClass 或 jdbcUrl 解析并加载 JDBC Driver，赋值给父类的 driver 字段，后续通过 createPhysicalConnection() 方法创建连接
             resolveDriver();
 
-            // 做更多一致性检查（如 URL 与 driver 是否匹配等）
+            // 一致性检查：对数据库类型、驱动版本、URL 与驱动匹配等进行校验
             initCheck();
 
-            // 用于 Connection.setNetworkTimeout(Executor, int) 的 Executor，这里用同步执行器，即调用时在当前线程执行。
+            // 网络超时执行器，同步执行器
+            // 用于 Connection.setNetworkTimeout(Executor, int) 的 Executor，设置 Socket 读超时
             this.netTimeoutExecutor = new SynchronousExecutor();
 
-            // 按配置初始化 ExceptionSorter，用于根据 SQL 异常判断连接是否应丢弃
+            // 异常分类器初始化
+            // 功能：根据数据库驱动类型，自动选择合适的异常分类器，用于判断 SQL 异常是否致命（连接是否应丢弃）。
             initExceptionSorter();
-            // 按配置初始化 ValidConnectionChecker，用于连接校验（testOnBorrow/testWhileIdle 等）
+            // 连接校验器初始化
+            // 功能：根据数据库驱动类型，自动选择合适的连接校验器，用于 testOnBorrow、testOnReturn、testWhileIdle 等场景。
             initValidConnectionChecker();
-            // 若开启了 testOnBorrow/testOnReturn/testWhileIdle 但没配 validationQuery 且没有 ValidConnectionChecker，会报错或打日志，避免无效校验
+            // 校验查询检查：若开启了 testOnBorrow/testOnReturn/testWhileIdle 但没配 validationQuery 且没有 ValidConnectionChecker，会报错或打日志，避免无效校验
             validationQueryCheck();
 
             // 统计对象 JdbcDataSourceStat
@@ -806,7 +845,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 是否允许监控页/API 重置统计，与配置的 resetStatEnable 一致
             dataSourceStat.setResetStatEnable(this.resetStatEnable);
 
-            // 分配池数组
+            // 池结构分配
             connections = new DruidConnectionHolder[maxActive];
             evictConnections = new DruidConnectionHolder[maxActive];
             keepAliveConnections = new DruidConnectionHolder[maxActive];
@@ -1138,22 +1177,27 @@ public class DruidDataSource extends DruidAbstractDataSource
     }
 
     private void validationQueryCheck() {
+        // 1. 如果没有开启任何校验，直接返回
         if (!(testOnBorrow || testOnReturn || testWhileIdle)) {
             return;
         }
 
+        // 2. 如果已经配置了 ValidConnectionChecker，则不需要 validationQuery
         if (this.validConnectionChecker != null) {
             return;
         }
 
+        // 3. 如果配置了 validationQuery，则可以使用
         if (this.validationQuery != null && this.validationQuery.length() > 0) {
             return;
         }
 
+        // 4. ODPS 数据库特殊处理
         if ("odps".equals(dbTypeName)) {
             return;
         }
 
+        // 5. 如果开启了校验但没有配置校验方式，记录错误日志
         String errorMessage = "";
 
         if (testOnBorrow) {

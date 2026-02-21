@@ -76,6 +76,49 @@ flowchart TD
         OP2_15["收尾与 MBean：init=true、initedTime、registerMbean、connectError 抛错、keepAlive 补建连"]
         OP2_16["保证状态与锁、成功日志：finally: inited=true、unlock、inited 日志"]
     end
+     flowchart TD
+    
+    subgraph "幂等控制防重入、防死锁"
+        OP1_1["if (inited) return;"]
+        OP1_2["DruidDriver.getInstance();"]
+    end
+    
+    subgraph "数据源初始化"
+        OP2_1["加锁、防并发 init、记录调用栈：lock.lockInterruptibly() + 双重检查 + initStackTrace"]
+        OP2_2["多数据源 ID 区分"]
+        OP2_3["jdbcUrl 处理与超时参数设置：initFromWrapDriverUrl + initTimeoutsFromUrlOrProperties"]
+        OP2_4["Filter 初始化:filter.init(this);"]
+        OP2_5["数据库类型设置"]
+        OP2_6["MySQL 驱动使用服务端配置缓存"]
+        OP2_7["数据池参数校验"]
+        OP2_8["驱动加载：driverClass + initFromSPIServiceLoader + resolveDriver"]
+        OP2_9["校验与执行器：initCheck + netTimeoutExecutor + ExceptionSorter + ValidConnectionChecker + validationQueryCheck"]
+        OP2_10["统计对象：dataSourceStat（全局或独立）"]
+        OP2_11["池结构分配：connections四个数组的初始化"]
+        OP2_12["初始连接：按 asyncInit/!asyncInit 预建 initialSize 个连接"]
+        OP2_13["三个后台线程：createAndLogThread + createAndStartCreatorThread + createAndStartDestroyThread"]
+        OP2_14["等线程就绪：	await Create/Destroy initedLatch"]
+        OP2_15["收尾与 MBean：init=true、initedTime、registerMbean、connectError 抛错、keepAlive 补建连"]
+        OP2_16["保证状态与锁、成功日志：finally: inited=true、unlock、inited 日志"]
+    end
+     
+    OP1_1 --> OP1_2
+    OP1_2 --> OP2_1
+    OP2_1 --> OP2_2
+    OP2_2 --> OP2_3
+    OP2_3 --> OP2_4
+    OP2_4 --> OP2_5
+    OP2_5 --> OP2_6
+    OP2_6 --> OP2_7
+    OP2_7 --> OP2_8
+    OP2_8 --> OP2_9
+    OP2_9 --> OP2_10
+    OP2_10 --> OP2_11
+    OP2_11 --> OP2_12
+    OP2_12 --> OP2_13
+    OP2_13 --> OP2_14
+    OP2_14 --> OP2_15
+    OP2_15 --> OP2_16
      
     OP1_1 --> OP1_2
     OP1_2 --> OP2_1
