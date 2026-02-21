@@ -2517,14 +2517,20 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         }
     }
 
+    /**
+     * 同步执行器
+     */
     class SynchronousExecutor implements Executor {
         @Override
         public void execute(Runnable command) {
             try {
+                // 直接在当前线程执行，不另起线程
                 command.run();
             } catch (AbstractMethodError error) {
+                //  // 标记驱动不支持 setNetworkTimeout，后续不再尝试
                 netTimeoutError = true;
             } catch (Exception ignored) {
+                // 打印异常日志
                 if (LOG.isDebugEnabled()) {
                     LOG.debug("failed to execute command " + command);
                 }

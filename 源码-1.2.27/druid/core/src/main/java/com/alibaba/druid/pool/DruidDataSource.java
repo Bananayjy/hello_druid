@@ -697,7 +697,7 @@ public class DruidDataSource extends DruidAbstractDataSource
              * 全局唯一的数据源 ID通过调用DruidDriver的createDataSourceId方法分配
              * 从全局自增计数器里为当前数据源分配一个唯一 id（第 1 个数据源=1，第 2 个=2，…），用于标识不同的数据源实例
              */
-            this.id = DruidDriver.createDataSourceId();
+            this.id = DruidDriver.createDa  taSourceId();
             /**
              * 对 connection/statement/resultSet/transaction 的 ID 种子做偏移（(id-1)*100000），这样多数据源时各数据源产生的 ID 区间错开，便于区分和排查
              *
@@ -803,7 +803,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             }
 
             // 驱动加载
-            // driverClass 驱动类去除首尾空格。
+            // driverClass 驱动非空，去除首尾空格。
             if (this.driverClass != null) {
                 this.driverClass = driverClass.trim();
             }
@@ -815,17 +815,19 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 一致性检查：对数据库类型、驱动版本、URL 与驱动匹配等进行校验
             initCheck();
 
-            // 网络超时执行器，同步执行器
-            // 用于 Connection.setNetworkTimeout(Executor, int) 的 Executor，设置 Socket 读超时
+            // 网络超时执行器，同步执行器（com.alibaba.druid.pool.DruidAbstractDataSource内部类）
+            // 专门给 Connection.setNetworkTimeout(Executor, int) 用的 Executor，在 DruidAbstractDataSource.createPhysicalConnection() 里使用
+            // JDBC 4.1 规定设置网络超时时要传一个 Executor，用于驱动在发生网络超时或执行超时回调时用的，对于Druid 不需要异步回调，所以用“同步执行器”即可
             this.netTimeoutExecutor = new SynchronousExecutor();
 
             // 异常分类器初始化
             // 功能：根据数据库驱动类型，自动选择合适的异常分类器，用于判断 SQL 异常是否致命（连接是否应丢弃）。
             initExceptionSorter();
             // 连接校验器初始化
-            // 功能：根据数据库驱动类型，自动选择合适的连接校验器，用于 testOnBorrow、testOnReturn、testWhileIdle 等场景。
+            // 功能：根据当前 Driver 的类名，在未显式配置的情况下，为数据源选一个 ValidConnectionChecker，用于 testOnBorrow、testOnReturn、testWhileIdle 等场景下判断连接是否仍然可用（可替代或配合 validationQuery）
             initValidConnectionChecker();
-            // 校验查询检查：若开启了 testOnBorrow/testOnReturn/testWhileIdle 但没配 validationQuery 且没有 ValidConnectionChecker，会报错或打日志，避免无效校验
+            // 校验查询检查
+            // 在开启了连接校验开关（testOnBorrow / testOnReturn / testWhileIdle）的前提下，检查是否具备至少一种可用的校验手段（ValidConnectionChecker 或 validationQuery）；若没有，则打 ERROR 日志，避免“开了校验却无法真正校验”的无效配置
             validationQueryCheck();
 
             // 统计对象 JdbcDataSourceStat
@@ -895,7 +897,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 3.创建并启动 DestroyConnectionThread，负责空闲检测、回收超时连接、保活等
             createAndStartDestroyThread();
 
-            // 等待 Create/Destroy 线程就绪
+            // 等待连接 Create/Destroy 线程就绪
             // await threads initedLatch to support dataSource restart.
             if (createConnectionThread != null) {
                 createConnectionThread.getInitedLatch().await();
@@ -907,10 +909,16 @@ public class DruidDataSource extends DruidAbstractDataSource
             // 标记成功，表示本次 try 块内逻辑成功，finally 里会据此决定是否打 "inited" 日志
             init = true;
 
-            // 录初始化完成时间
+            // 记录初始化完成时间
             initedTime = new Date();
 
-            // 注册Mbean，把当前数据源注册到 JMX，便于监控和管
+            /**
+             * 注册Mbean
+             * 把当前 DruidDataSource 注册到 JMX，并记下它在 JMX 里的名字（ObjectName）
+             * 暴露到 JMX，便于监控和运维
+             * 纳入 Druid 统一统计与监控
+             * 与 close 时的 unregister 成对，保证生命周期正确、不泄漏
+             */
             registerMbean();
 
             // 同步初始化失败时抛错（池为空）
@@ -1177,17 +1185,17 @@ public class DruidDataSource extends DruidAbstractDataSource
     }
 
     private void validationQueryCheck() {
-        // 1. 如果没有开启任何校验，直接返回
+        // // 1. 三种校验都未开 → 无需校验手段，直接通过
         if (!(testOnBorrow || testOnReturn || testWhileIdle)) {
             return;
         }
 
-        // 2. 如果已经配置了 ValidConnectionChecker，则不需要 validationQuery
+        // 2. 已配置 ValidConnectionChecker → 不需要 validationQuery 也可校验，通过
         if (this.validConnectionChecker != null) {
             return;
         }
 
-        // 3. 如果配置了 validationQuery，则可以使用
+        // 3. 3. 已配置 validationQuery（非空字符串）→ 可用 SQL 校验，通过
         if (this.validationQuery != null && this.validationQuery.length() > 0) {
             return;
         }
@@ -1197,7 +1205,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             return;
         }
 
-        // 5. 如果开启了校验但没有配置校验方式，记录错误日志
+        // 5. 开了校验但既没有 ValidConnectionChecker 也没有 validationQuery → 配置错误，打 ERROR
         String errorMessage = "";
 
         if (testOnBorrow) {
@@ -1372,15 +1380,19 @@ public class DruidDataSource extends DruidAbstractDataSource
 
     }
 
+    /**
+     * 根据当前使用的 JDBC Driver 类型，在未显式配置的情况下，为数据源选一个合适的 ExceptionSorter，用于判断：某次 SQL 异常是否“致命”——即该连接是否应被丢弃、不再回池
+     */
     private void initExceptionSorter() {
-        if (exceptionSorter instanceof NullExceptionSorter) {
+        if (exceptionSorter instanceof NullExceptionSorter) {   // 若已是 NullExceptionSorter 且不是 MockDriver，后面会按驱动选一个；若是 MockDriver 则直接 return
             if (driver instanceof MockDriver) {
                 return;
             }
-        } else if (this.exceptionSorter != null) {
+        } else if (this.exceptionSorter != null) {  // 用户已配置了 ExceptionSorter，不覆盖
             return;
         }
 
+        // 按 driver 的类名（含父类）匹配，选内置的 Sorter
         for (Class<?> driverClass = driver.getClass(); ; ) {
             String realDriverClassName = driverClass.getName();
             if (realDriverClassName.equals(JdbcConstants.MYSQL_DRIVER) //
