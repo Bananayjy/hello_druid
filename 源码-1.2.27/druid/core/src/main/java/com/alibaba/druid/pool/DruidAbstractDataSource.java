@@ -89,59 +89,103 @@ import static com.alibaba.druid.util.JdbcConstants.POSTGRESQL_DRIVER;
  */
 public abstract class DruidAbstractDataSource extends WrapperAdapter implements DruidAbstractDataSourceMBean, DataSource,
     DataSourceProxy, Serializable, DataSourceMonitorable {
+
+    // 常量
+    // 序列化版本号
     private static final long serialVersionUID = 1L;
+    // 日志
     private static final Log LOG = LogFactory.getLog(DruidAbstractDataSource.class);
-
+    // 默认初始连接数
     public static final int DEFAULT_INITIAL_SIZE = 0;
+    // 默认最大活跃连接数
     public static final int DEFAULT_MAX_ACTIVE_SIZE = 8;
+    // 默认最大空闲（已废弃）
     public static final int DEFAULT_MAX_IDLE = 8;
+    // 默认最小空闲连接数
     public static final int DEFAULT_MIN_IDLE = 0;
+    // 默认获取连接最大等待毫秒（-1=无限等）
     public static final int DEFAULT_MAX_WAIT = -1;
-    public static final String DEFAULT_VALIDATION_QUERY = null;                                                //
+    // 默认校验 SQL
+    public static final String DEFAULT_VALIDATION_QUERY = null;
+    // 默认借出时是否校验
     public static final boolean DEFAULT_TEST_ON_BORROW = false;
+    // 默认归还时是否校验
     public static final boolean DEFAULT_TEST_ON_RETURN = false;
+    // 默认空闲时是否校验
     public static final boolean DEFAULT_WHILE_IDLE = true;
+    // 默认回收检测间隔（毫秒）
     public static final long DEFAULT_TIME_BETWEEN_EVICTION_RUNS_MILLIS = 60 * 1000L;
+    // 默认建连失败后重试间隔
     public static final long DEFAULT_TIME_BETWEEN_CONNECT_ERROR_MILLIS = 500;
+    // 默认每次回收检测检查连接数
     public static final int DEFAULT_NUM_TESTS_PER_EVICTION_RUN = 3;
+    // 默认建连超时
     public static final int DEFAULT_TIME_CONNECT_TIMEOUT_MILLIS = 10_000;
+    // 默认 Socket 读超时
     public static final int DEFAULT_TIME_SOCKET_TIMEOUT_MILLIS = 10_000;
-
+    // 默认最小可回收空闲时间
     public static final long DEFAULT_MIN_EVICTABLE_IDLE_TIME_MILLIS = 1000L * 60L * 30L;
+    // 默认最大可回收空闲时间
     public static final long DEFAULT_MAX_EVICTABLE_IDLE_TIME_MILLIS = 1000L * 60L * 60L * 7;
+    // 默认物理连接最大存活时间（-1=不限制）
     public static final long DEFAULT_PHY_TIMEOUT_MILLIS = -1;
 
+    // 新连接默认自动提交，默认 true
     protected volatile boolean defaultAutoCommit = true;
+    // 新连接默认只读，null 表示不设置
     protected volatile Boolean defaultReadOnly;
+    // 新连接默认事务隔离级别，null 表示不设置
     protected volatile Integer defaultTransactionIsolation;
+    // 新连接默认 Catalog
     protected volatile String defaultCatalog;
 
+    // 数据源名称，用于日志/JMX
     protected String name;
 
+    // 数据库用户名
     protected volatile String username;
+    // 数据库密码
     protected volatile String password;
+    // 数据库 URL
     protected volatile String jdbcUrl;
+    // 驱动类名
     protected volatile String driverClass;
+    // 加载驱动的 ClassLoader
     protected volatile ClassLoader driverClassLoader;
+    // 连接时传给 Driver 的 Properties
     protected volatile Properties connectProperties = new Properties();
-
+    // 动态用户名/密码（JAAS 等）
     protected volatile PasswordCallback passwordCallback;
     protected volatile NameCallback userCallback;
 
+    // 初始化时创建的连接数，默认为 0
     protected volatile int initialSize = DEFAULT_INITIAL_SIZE;
+    // 池中最大活跃连接数，默认为8
     protected volatile int maxActive = DEFAULT_MAX_ACTIVE_SIZE;
+    // 最小空闲连接数，默认为0
     protected volatile int minIdle = DEFAULT_MIN_IDLE;
+    // 已废弃，保留兼容
     protected volatile int maxIdle = DEFAULT_MAX_IDLE;
+    // 获取连接最大等待毫秒，默认为-1，表示一直等
     protected volatile long maxWait = DEFAULT_MAX_WAIT;
+    // 池满超时后的重试次数
     protected int notFullTimeoutRetryCount;
 
+    // 校验 SQL（如 SELECT 1），默认null
     protected volatile String validationQuery = DEFAULT_VALIDATION_QUERY;
+    // 校验超时（秒）， 默认-1
     protected volatile int validationQueryTimeout = -1;
+    // 借出时是否校验，默认false
     protected volatile boolean testOnBorrow = DEFAULT_TEST_ON_BORROW;
+    // 归还时是否校验，默认false
     protected volatile boolean testOnReturn = DEFAULT_TEST_ON_RETURN;
+    // 空闲检测时是否校验。默认true
     protected volatile boolean testWhileIdle = DEFAULT_WHILE_IDLE;
+    // 是否池化 PreparedStatement
     protected volatile boolean poolPreparedStatements;
+    // 是否共享 PreparedStatement
     protected volatile boolean sharePreparedStatements;
+    // 每连接 PS 缓存上限
     protected volatile int maxPoolPreparedStatementPerConnectionSize = 10;
 
     protected volatile boolean inited;
@@ -149,8 +193,11 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected PrintWriter logWriter = new PrintWriter(System.out);
 
+    // 已注册的 Filter（包括 Spring Boot 里 autoAddFilters 注入的）
     protected List<Filter> filters = new CopyOnWriteArrayList<Filter>();
+    // 是否允许 clearFilters，默认 true
     private boolean clearFiltersEnable = true;
+    // 根据异常判断连接是否应丢弃
     protected volatile ExceptionSorter exceptionSorter;
 
     protected Driver driver;
@@ -166,6 +213,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected long createTimespan;
 
     protected volatile int maxWaitThreadCount = -1;
+    // 是否允许通过 getRawConnection 拿到底层连接，默认 true
     protected volatile boolean accessToUnderlyingConnectionAllowed = true;
 
     protected volatile long timeBetweenEvictionRunsMillis = DEFAULT_TIME_BETWEEN_EVICTION_RUNS_MILLIS;
@@ -180,6 +228,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile long removeAbandonedTimeoutMillis = 300 * 1000;
     protected volatile boolean logAbandoned;
 
+    // 兼容别名，同上一项
     protected volatile int maxOpenPreparedStatements = -1;
 
     protected volatile List<String> connectionInitSqls;
@@ -188,20 +237,27 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
 
     protected volatile long timeBetweenConnectErrorMillis = DEFAULT_TIME_BETWEEN_CONNECT_ERROR_MILLIS;
 
+    // 自定义校验器
     protected volatile ValidConnectionChecker validConnectionChecker;
 
+    // 是否用 Connection.ping（部分驱动）
     protected volatile boolean usePingMethod;
 
     protected final Map<DruidPooledConnection, Object> activeConnections = new IdentityHashMap<DruidPooledConnection, Object>();
+
+    // 用于 activeConnections 的占位值
     protected static final Object PRESENT = new Object();
 
+    // 数据源实例 ID（如 getDataSourceId()）
     protected long id;
 
     protected int connectionErrorRetryAttempts = 1;
     protected boolean breakAfterAcquireFailure;
     protected long transactionThresholdMillis;
 
+    // 对象创建时间
     protected final java.util.Date createdTime = new java.util.Date();
+    // init 完成时间
     protected java.util.Date initedTime;
     protected volatile long errorCount;
     protected volatile long dupCloseCount;
@@ -216,8 +272,19 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile long cachedPreparedStatementMissCount;
     protected volatile long userPasswordVersion;
 
+    // 缓存的 Filter 链实例，createChain/recycleFilterChain 复用
+    // 缓存一条 FilterChainImpl，避免每次建连都 new，用完后 reset 再塞回去复用
     private volatile FilterChainImpl filterChain;
 
+    /**
+     * AtomicLongFieldUpdater
+     * 包：java.util.concurrent.atomic.AtomicLongFieldUpdater
+     * 作用：对某个类的某个 volatile long 字段做原子读/写/加减，而不需要把整个字段改成 AtomicLong 类型， 专门用来对 DruidAbstractDataSource 实例里的某个 volatile long 做原子更新的工具对象
+     * 优点：
+     * 1.不增加对象体积（字段仍是 long），适合像连接池这种实例很多、统计字段很多的场景
+     * 2.多个线程同时 incrementAndGet / getAndSet 时仍然线程安全，且比用 synchronized 包住整块逻辑更轻量
+     * 创建方式：AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "字段名")
+     */
     static final AtomicLongFieldUpdater<DruidAbstractDataSource>
             errorCountUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "errorCount"),
             dupCloseCountUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "dupCloseCount"),
@@ -231,6 +298,11 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
             cachedPreparedStatementDeleteCountUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "cachedPreparedStatementDeleteCount"),
             cachedPreparedStatementMissCountUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "cachedPreparedStatementMissCount"),
             userPasswordVersionUpdater = AtomicLongFieldUpdater.newUpdater(DruidAbstractDataSource.class, "userPasswordVersion");
+
+    /**
+     * DruidAbstractDataSource 的 filterChain 字段做“原子读/写/置换”的工具对象
+     * key：DruidAbstractDataSource 实例，value： FilterChainImpl
+     */
     protected static final AtomicReferenceFieldUpdater<DruidAbstractDataSource, FilterChainImpl> filterChainUpdater
             = AtomicReferenceFieldUpdater.newUpdater(DruidAbstractDataSource.class, FilterChainImpl.class, "filterChain");
 
@@ -266,10 +338,14 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected boolean isMySql;
     protected boolean useOracleImplicitCache = true;
 
+    // 主锁，保护取连接/回收/池状态（子类 getConnection/recycle 使用）
     protected ReentrantLock lock;
+    // 由 lock 创建，“池非空”条件，取连接时等待
     protected Condition notEmpty;
+    // 由 lock 创建，“池为空”条件，回收/创建时可能用
     protected Condition empty;
 
+    // 保护 activeConnections 的锁
     protected ReentrantLock activeConnectionLock = new ReentrantLock();
 
     protected volatile int createErrorCount;
@@ -317,28 +393,51 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile Throwable keepAliveError;
 
     /**
+     * 构造函数
      * Constructs a new DruidAbstractDataSource with a specified lock fairness setting.
-     *
-     * @param lockFair a boolean value indicating whether the lock should be fair or not
+     * 构造一个新的DruidAbstractDataSource对象，并指定锁的公平性设置
+     * @param lockFair a boolean value indicating whether the lock should be fair or not；
+     *                 true 为公平锁，false 为非公平（默认非公平，吞吐更好）。
      */
     public DruidAbstractDataSource(boolean lockFair) {
+        // 创建ReentrantLock
         lock = new ReentrantLock(lockFair);
+        //
         notEmpty = lock.newCondition();
+        //
         empty = lock.newCondition();
     }
 
+    /**
+     * Filter 链的创建
+     * 作用：取一条可用的 Filter 链。优先用缓存的 filterChain（CAS 取出），没有就新建
+     * 说明：每次创建物理连接且存在 Filter 时（见 createPhysicalConnection(String, Properties)），用这条链执行 connection_connect，避免频繁 new FilterChainImpl。
+     * @return
+     */
     protected FilterChainImpl createChain() {
+        // 原子地取走并清空缓存链，把当前实例的 filterChain 原子地改成 null，并返回原来的链
         FilterChainImpl chain = filterChainUpdater.getAndSet(this, null);
         if (chain == null) {
+            // 若没有缓存，chain 为 null，创建新的Filter链实例
             chain = new FilterChainImpl(this);
         }
+        // 返回filterChain对象
         return chain;
     }
 
+    /**
+     * Filter 链的回收
+     * 作用：把用过的链重置后写回 filterChain，供下次 createChain() 复用
+     * 说明：与 createChain() 成对使用，用完链必须 recycle，否则会重复 new。
+     * @param chain
+     */
     protected void recycleFilterChain(FilterChainImpl chain) {
+        // 重置 Filter链
         chain.reset();
+        // 把链塞回 filterChain 缓存
         filterChainUpdater.lazySet(this, chain);
     }
+
 
     public boolean isUseLocalSessionState() {
         return useLocalSessionState;
@@ -602,6 +701,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         this.transactionThresholdMillis = transactionThresholdMillis;
     }
 
+    // 记录事务信息（抽象方法，由 DruidDataSource 实现）
     public abstract void logTransaction(TransactionInfo info);
 
     public long[] getTransactionHistogramValues() {
@@ -1113,6 +1213,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         return poolPreparedStatements;
     }
 
+    // 是否池化 PreparedStatement【抽象方法，由 DruidDataSource 实现】
     public abstract void setPoolPreparedStatements(boolean value);
 
     public long getMaxWait() {
@@ -1193,6 +1294,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         return maxActive;
     }
 
+    // 设置最大活跃连接数（可能涉及队列/信号量）【抽象方法，由 DruidDataSource 实现】
     public abstract void setMaxActive(int maxActive);
 
     public String getUsername() {
@@ -1231,6 +1333,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         return connectProperties;
     }
 
+    // 设置连接属性【抽象方法，由 DruidDataSource 实现】
     public abstract void setConnectProperties(Properties properties);
 
     public void setConnectionProperties(String connectionProperties) {
@@ -1703,26 +1806,42 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
         handleConnectionException(conn, t, null);
     }
 
+    // 连接异常时的处理（是否丢弃连接、更新错误统计等）【由 DruidDataSource 实现】
     public abstract void handleConnectionException(
             DruidPooledConnection conn,
             Throwable t,
             String sql
     ) throws SQLException;
 
+    // 连接归还到池（放入空闲队列、更新状态等）【抽象方法，由 DruidDataSource 实现】
     protected abstract void recycle(DruidPooledConnection pooledConnection) throws SQLException;
 
+    /**
+     * 物理数据库连接创建
+     * @param url
+     * @param info
+     * @return
+     * @throws SQLException
+     */
     public Connection createPhysicalConnection(String url, Properties info) throws SQLException {
+        // 数据库连接
         Connection conn;
-        if (getProxyFilters().isEmpty()) {
+        if (getProxyFilters().isEmpty()) {  // 无 Filter
+            // 直接 Driver.connect
             Connection rawConn = getDriver().connect(url, info);
             Statement stmt = rawConn.createStatement();
+            // 包成 DruidStatementConnection（内部持有一个 Statement，用于 initSql/校验等）
             conn = new DruidStatementConnection(rawConn, stmt);
-        } else {
+        } else {    // 有 Filter
+            // Filter 链的创建
             FilterChainImpl filterChain = createChain();
+            // FilterChainImpl.connection_connect(info) 建连，链里会调用 Driver 并可能包装成代理 Connection（统计、日志、Wall 等）
             conn = filterChain.connection_connect(info);
+            // Filter 链的回收
             recycleFilterChain(filterChain);
         }
 
+        // 每次成功创建连接，该字段都会递增，用于统计
         createCountUpdater.incrementAndGet(this);
 
         return conn;

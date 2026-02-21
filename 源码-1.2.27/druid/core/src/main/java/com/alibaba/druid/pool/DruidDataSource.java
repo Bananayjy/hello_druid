@@ -656,16 +656,27 @@ public class DruidDataSource extends DruidAbstractDataSource
         this.connectProperties = properties;
     }
 
+    /**
+     * 在首次使用时对数据源初始化
+     * @throws SQLException
+     */
     public void init() throws SQLException {
+        // inited标记是否初始化过，若已经初始化过，直接返回，避免重复执行
+        // inited 在方法最后的 finally 里会被置为 true，所以第一次之后调用 init() 都会从这里退出
         if (inited) {
             return;
         }
 
+        // 预加载 DruidDriver（单例）
+        // 提前触发 DruidDriver 的类加载与初始化
+        // 若在持锁状态下才第一次加载 DruidDriver，可能和其静态初始化里的锁产生死锁，所以在这里先执行一次，避免在后面的 lock.lockInterruptibly() 之后再去加载
         // bug fixed for dead lock, for issue #2980
         DruidDriver.getInstance();
 
+        // 通过锁保证同一时刻只有一个线程在执行 init 逻辑，避免多线程并发 init
         final ReentrantLock lock = this.lock;
         try {
+            // 可被中断的加锁，若等待过程中线程被中断，会抛 InterruptedException，这里转成 SQLException 抛出
             lock.lockInterruptibly();
         } catch (InterruptedException e) {
             throw new SQLException("interrupt", e);
@@ -673,13 +684,18 @@ public class DruidDataSource extends DruidAbstractDataSource
 
         boolean init = false;
         try {
+            // 拿到锁后再看一次，防止两个线程都通过最外层的 if (inited) 后，只有一个能完成 init，另一个直接返回
             if (inited) {
                 return;
             }
 
+            // 记录当前线程的调用栈，用于监控/排查“是谁触发了 init”（例如 DataSourceMonitorable.getInitStackTrace()）
             initStackTrace = Utils.toString(Thread.currentThread().getStackTrace());
 
+            // 全局唯一的数据源 ID通过调用DruidDriver的createDataSourceId方法分配
+            // 从全局自增计数器里为当前数据源分配一个唯一 id（第 1 个数据源=1，第 2 个=2，…）
             this.id = DruidDriver.createDataSourceId();
+            // 对 connection/statement/resultSet/transaction 的 ID 种子做偏移（(id-1)*100000），这样多数据源时各数据源产生的 ID 区间错开，便于区分和排查
             if (this.id > 1) {
                 long delta = (this.id - 1) * 100000;
                 connectionIdSeedUpdater.addAndGet(this, delta);
@@ -688,20 +704,29 @@ public class DruidDataSource extends DruidAbstractDataSource
                 transactionIdSeedUpdater.addAndGet(this, delta);
             }
 
+            // jdbcUrl解析
             if (this.jdbcUrl != null) {
+                // 去掉首尾空格
                 this.jdbcUrl = this.jdbcUrl.trim();
+                // 若 jdbcURL 是 Druid 包装驱动格式（如带 druid: 或特定前缀），则解析并可能替换为真实 URL、加载真实驱动等
                 initFromWrapDriverUrl();
             }
+            // 从 jdbcUrl 的 query 参数或 connectProperties 里解析 connectTimeout、socketTimeout，并调用对应的 setter，保证建连/读超时被正确设置
             initTimeoutsFromUrlOrProperties();
 
+            //  Filter 初始化
+            // 对已加入的每个 Filter 调用 filter.init(this)，把当前 DataSource 传给 Filter，让 Filter 做自己的初始化（如加载配置、注册统计等）
             for (Filter filter : filters) {
                 filter.init(this);
             }
 
+            // 若未设置 dbTypeName，则根据 jdbcUrl 推断数据库类型
+            // 后续建连、超时、校验等都会按库类型区分处理
             if (this.dbTypeName == null || this.dbTypeName.length() == 0) {
                 this.dbTypeName = JdbcUtils.getDbType(jdbcUrl, null);
             }
 
+            // 若 URL 或 connectProperties 里已经带了 cacheServerConfiguration，则显式在 connectProperties 里设为 "true"，保证 MySQL 驱动使用服务端配置缓存，避免重复查询
             DbType dbType = DbType.of(this.dbTypeName);
             if (JdbcUtils.isMysqlDbType(dbType)) {
                 boolean cacheServerConfigurationSet = false;
@@ -715,6 +740,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                 }
             }
 
+            //  池参数校验
             if (maxActive <= 0) {
                 throw new IllegalArgumentException("illegal maxActive " + maxActive);
             }
@@ -739,24 +765,34 @@ public class DruidDataSource extends DruidAbstractDataSource
                 throw new SQLException("keepAliveBetweenTimeMillis must be greater than timeBetweenEvictionRunsMillis");
             }
 
+            // driverClass 驱动类去除首尾空格。
             if (this.driverClass != null) {
                 this.driverClass = driverClass.trim();
             }
 
+            // 通过 Java SPI 扫描并加载在 META-INF/services 里声明的 Filter 等扩展，并可能加入 filters
             initFromSPIServiceLoader();
 
+            // 根据 driverClass 或 jdbcUrl 解析并加载 JDBC Driver，赋值给父类的 driver 字段，后续通过 createPhysicalConnection() 方法创建连接
             resolveDriver();
 
+            // 做更多一致性检查（如 URL 与 driver 是否匹配等）
             initCheck();
 
+            // 用于 Connection.setNetworkTimeout(Executor, int) 的 Executor，这里用同步执行器，即调用时在当前线程执行。
             this.netTimeoutExecutor = new SynchronousExecutor();
 
+            // 按配置初始化 ExceptionSorter，用于根据 SQL 异常判断连接是否应丢弃
             initExceptionSorter();
+            // 按配置初始化 ValidConnectionChecker，用于连接校验（testOnBorrow/testWhileIdle 等）
             initValidConnectionChecker();
+            // 若开启了 testOnBorrow/testOnReturn/testWhileIdle 但没配 validationQuery 且没有 ValidConnectionChecker，会报错或打日志，避免无效校验
             validationQueryCheck();
 
-            if (isUseGlobalDataSourceStat()) {
+            // 统计对象 JdbcDataSourceStat
+            if (isUseGlobalDataSourceStat()) {  // 使用全局单例的 JdbcDataSourceStat，多数据源共享同一套统计
                 dataSourceStat = JdbcDataSourceStat.getGlobal();
+                // 若尚未创建则创建并设为 Global
                 if (dataSourceStat == null) {
                     dataSourceStat = new JdbcDataSourceStat("Global", "Global", this.dbTypeName);
                     JdbcDataSourceStat.setGlobal(dataSourceStat);
@@ -764,11 +800,13 @@ public class DruidDataSource extends DruidAbstractDataSource
                 if (dataSourceStat.getDbType() == null) {
                     dataSourceStat.setDbType(this.dbTypeName);
                 }
-            } else {
+            } else {    // 为当前数据源 new 一个 JdbcDataSourceStat（name、jdbcUrl、dbTypeName、connectProperties）
                 dataSourceStat = new JdbcDataSourceStat(this.name, this.jdbcUrl, this.dbTypeName, this.connectProperties);
             }
+            // 是否允许监控页/API 重置统计，与配置的 resetStatEnable 一致
             dataSourceStat.setResetStatEnable(this.resetStatEnable);
 
+            // 分配池数组
             connections = new DruidConnectionHolder[maxActive];
             evictConnections = new DruidConnectionHolder[maxActive];
             keepAliveConnections = new DruidConnectionHolder[maxActive];
@@ -776,38 +814,49 @@ public class DruidDataSource extends DruidAbstractDataSource
 
             SQLException connectError = null;
 
-            if (createScheduler != null && asyncInit) {
+            // 预建连接（连接池初始化）
+            if (createScheduler != null && asyncInit) { // 异步初始化
+                // asyncInit 且已有 createScheduler：不阻塞，通过 submitCreateTask(true) 提交 initialSize 个建连任务到线程池，由后台线程异步建连并放入池。
                 for (int i = 0; i < initialSize; ++i) {
                     submitCreateTask(true);
                 }
-            } else if (!asyncInit) {
+            } else if (!asyncInit) {    // 同步初始化
                 // init connections
+                // 循环直到 poolingCount == initialSize
                 while (poolingCount < initialSize) {
                     try {
+                        // 每次 createPhysicalConnection() 得到 PhysicalConnectionInfo
                         PhysicalConnectionInfo pyConnectInfo = createPhysicalConnection();
+                        // 再 new DruidConnectionHolder
                         DruidConnectionHolder holder = new DruidConnectionHolder(this, pyConnectInfo);
+                        // 放入 connections并 poolingCount++
                         connections[poolingCount++] = holder;
-                    } catch (SQLException ex) {
+                    } catch (SQLException ex) { // 若某次建连抛 SQLException
                         LOG.error("init datasource error, url: " + this.getUrl(), ex);
-                        if (initExceptionThrow) {
+                        if (initExceptionThrow) {   // initExceptionThrow = true：记录 connectError 并 break，后面若池为空会再抛
                             connectError = ex;
                             break;
-                        } else {
+                        } else {    // initExceptionThrow = false：只打日志，sleep 3 秒后继续尝试（直到达到 initialSize 或一直失败）
                             Thread.sleep(3000);
                         }
                     }
                 }
-
+                // 若 poolingCount > 0：更新 poolingPeak、poolingPeakTime，表示初始阶段空闲连接峰值
                 if (poolingCount > 0) {
                     poolingPeak = poolingCount;
                     poolingPeakTime = System.currentTimeMillis();
                 }
             }
 
+            //  创建并启动三个线程
+            // 1.若 timeBetweenLogStatsMillis > 0，则启动 LogStatsThread，按间隔打印池统计日志
             createAndLogThread();
+            // 2.创建并启动 CreateConnectionThread，负责在池不满时调用 emptySignal() 等逻辑去异步建连，填满到 minIdle/maxActive
             createAndStartCreatorThread();
+            // 3.创建并启动 DestroyConnectionThread，负责空闲检测、回收超时连接、保活等
             createAndStartDestroyThread();
 
+            // 等待 Create/Destroy 线程就绪
             // await threads initedLatch to support dataSource restart.
             if (createConnectionThread != null) {
                 createConnectionThread.getInitedLatch().await();
@@ -816,32 +865,38 @@ public class DruidDataSource extends DruidAbstractDataSource
                 destroyConnectionThread.getInitedLatch().await();
             }
 
+            // 标记成功，表示本次 try 块内逻辑成功，finally 里会据此决定是否打 "inited" 日志
             init = true;
 
+            // 录初始化完成时间
             initedTime = new Date();
+
+            // 注册Mbean，把当前数据源注册到 JMX，便于监控和管
             registerMbean();
 
+            // 同步初始化失败时抛错（池为空）
             if (connectError != null && poolingCount == 0) {
                 throw connectError;
             }
 
+            // keepAlive = true 时希望尽快达到 minIdle
             if (keepAlive) {
-                if (createScheduler != null) {
+                if (createScheduler != null) {  // 若有 createScheduler：再提交 minIdle - initialSize 个建连任务（若 initialSize 已 >= minIdle 则循环 0 次）
                     // async fill to minIdle
                     for (int i = 0; i < minIdle - initialSize; ++i) {
                         submitCreateTask(true);
                     }
-                } else {
+                } else {    // 只发一次 empty.signal()，唤醒 Create 线程，由它按需建连到 minIdle
                     empty.signal();
                 }
             }
 
-        } catch (SQLException e) {
+        } catch (SQLException e) { // 打日志并原样抛出。
             LOG.error("{dataSource-" + this.getID() + "} init error", e);
             throw e;
-        } catch (InterruptedException e) {
+        } catch (InterruptedException e) {  // 包装成 SQLException 抛出（例如 await 被中断）
             throw new SQLException(e.getMessage(), e);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException e) {  // 打日志后继续抛出，保证 init 失败时调用方能感知
             LOG.error("{dataSource-" + this.getID() + "} init error", e);
             throw e;
         } catch (Error e) {
@@ -849,9 +904,13 @@ public class DruidDataSource extends DruidAbstractDataSource
             throw e;
 
         } finally {
+            // 标记已初始化
             inited = true;
+
+            // 解锁
             lock.unlock();
 
+            // 打日志
             if (init && LOG.isInfoEnabled()) {
                 String msg = "{dataSource-" + this.getID();
 
