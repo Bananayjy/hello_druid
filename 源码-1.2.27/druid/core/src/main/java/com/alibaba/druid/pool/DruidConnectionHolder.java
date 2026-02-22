@@ -79,6 +79,7 @@ public final class DruidConnectionHolder {
     protected int underlyingTransactionIsolation;
     protected boolean underlyingAutoCommit;
     protected volatile boolean discard;
+    // 当前是否处于“已借给业务”的状态
     protected volatile boolean active;
     protected final Map<String, Object> variables;
     protected final Map<String, Object> globalVariables;

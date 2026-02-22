@@ -48,7 +48,7 @@
 
 
 
-
+![mermaid-diagram-2026-02-22-104214](Y:\香蕉宝宝\Do\数据库相关\hello_druid\文档\druid学习文档.assets\mermaid-diagram-2026-02-22-104214.png)
 
 ```
 
@@ -210,7 +210,108 @@ try {
 
 
 
+### 2、获取连接
 
+入口：com.alibaba.druid.pool.DruidDataSource#getConnection()
+
+```
+
+```
+
+
+
+
+
+
+
+详解：
+
+1、为什么这个链要设计成既要拿，又要还
+
+“拿”是为了从缓存里取一条可用的链（没有再 new），“还”是把用过的链 reset 后放回缓存，供下次 getConnection 复用，从而在高并发下少 new、少 GC；链是有状态的，所以必须 reset 再还，不能只拿不还。
+
+2、关于建连线程的唤醒、调度
+
+Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 里创建）：
+
+| 条件变量 | 含义                     | 谁在等                                                    | 谁在唤醒                                         |
+| :------- | :----------------------- | :-------------------------------------------------------- | :----------------------------------------------- |
+| notEmpty | 池里有空闲连接           | 取连接的线程（在 pollLast 里）                            | 放连接进池时（put/putLast）                      |
+| empty    | 池需要建连（池空或未满） | CreateConnectionThread（仅在没有 createScheduler 时存在） | emptySignal()（仅在没有 createScheduler 时调用） |
+
+- 取连接：拿不到连接时在 notEmpty.await() 上等；有连接放进池就 notEmpty.signal()，取连接线程被唤醒。
+
+- 建连接：没有调度器时，由 CreateConnectionThread 在 empty.await() 上等；有人调 emptySignal() 就 empty.signal()，建连线程被唤醒去建连，建完通过 put → putLast → notEmpty.signal() 再唤醒取连接的线程。
+
+也就是说：emptySignal 负责的是「通知建连侧去干活」，真正让取连接线程结束等待的是「建连/回收后对 notEmpty 的 signal」
+
+模式 A：createScheduler == null（单线程建连）：
+
+- 建连线程：只有一个 CreateConnectionThread，在 lock 下循环：
+
+- 先判断要不要等：若 poolingCount >= notEmptyWaitThreadCount 且非 keepAlive/非失败等，就认为「没人等连接」，empty.await() 挂起。
+
+- 被 empty.signal() 唤醒后，再检查 activeCount + poolingCount >= maxActive，满则再次 empty.await()。
+
+- 否则 lock.unlock()，执行 createPhysicalConnection()（建连过程不占锁），建完后 put(connection)。
+
+- put(connection)：在 put 里再次 lock，把连接放进 connections，poolingCount++，然后 notEmpty.signal()，唤醒一个在 pollLast 里等 notEmpty 的取连接线程。
+
+因此，唤醒与调度链是：
+
+1. 取连接时池空 → pollLast 里 emptySignal() → empty.signal()
+
+1. CreateConnectionThread 从 empty.await() 被唤醒 → 建连 → put → putLast → notEmpty.signal()
+
+1. 正在 pollLast 里 notEmpty.await() 的某个线程被唤醒 → 从池里拿走刚放进去的连接，返回。
+
+初始化时若 keepAlive 且无 createScheduler，会执行一次 empty.signal()，让 CreateConnectionThread 第一次被唤醒，按 minIdle 等策略建连。
+
+模式 B：createScheduler != null（线程池建连）：
+
+- 没有 CreateConnectionThread，empty 不会被使用。
+
+- emptySignal() 只做 submitCreateTask(false)：
+
+- createTaskCount++， new CreateConnectionTask，createScheduler.submit(task)，任务进入线程池队列。
+
+- 线程池里某个工作线程执行 CreateConnectionTask.runInternal()：
+
+- 先 lock，检查 closed、池满、是否需要放弃本次建连（如没人等且非 initTask 等），通过则 unlock；
+
+- 然后 createPhysicalConnection()；
+
+- 再 put(physicalConnection)：内部 lock、放入池、notEmpty.signal()、unlock。
+
+- 在 pollLast 里 notEmpty.await() 的取连接线程被 notEmpty.signal() 唤醒，从池中取走连接。
+
+所以这里的「唤醒和调度」是：
+
+1. 取连接时池空 → pollLast 里 emptySignal() → submitCreateTask(false)（可能多次）。
+
+1. 调度器中的线程执行 CreateConnectionTask → 建连 → put → putLast → notEmpty.signal()。
+
+1. 取连接线程在 notEmpty.await() 上被唤醒 → 从池取连接返回。
+
+没有「empty 上的等待/唤醒」，只有「任务入队 → 线程池调度执行 → put → notEmpty.signal()」。
+
+
+
+总结：
+
+- emptySignal()：
+
+- 无 createScheduler 时：在池未满的前提下调 empty.signal()，唤醒 CreateConnectionThread，让它去建连并放入池（放池时 notEmpty.signal() 再唤醒取连接线程）。
+
+- 有 createScheduler 时：在未满且未超建连任务上限的前提下 submitCreateTask(false)，由线程池调度执行建连，建完同样通过 put → notEmpty.signal() 唤醒取连接线程。
+
+- 线程之间：
+
+- 取连接线程只在 notEmpty 上被唤醒（在 pollLast 里）；
+
+- 建连线程/任务由 emptySignal 通过 empty（单线程模式）或 createScheduler（线程池模式）触发；建连完成后通过 notEmpty.signal() 把等待的取连接线程唤醒。
+
+这样就把 emptySignal 的唤醒和调度 与 notEmpty 的配合关系说清楚了：emptySignal 管「让谁去建连」，notEmpty 管「谁可以拿到连接」。
 
 
 
@@ -234,7 +335,7 @@ try {
 
 # Druid 项目重要模块与后续学习建议
 
-## 一、项目整体结构（你当前看到的）
+一、项目整体结构（你当前看到的）
 
 | 模块                            | 说明                                             | 与你已学内容的关系                                           |
 | ------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ |
@@ -246,9 +347,7 @@ try {
 
 你接下来要深入的是 **core** 里和「连接池 + 监控 + 扩展」最相关的几块，并保持和 Starter 的衔接。
 
----
-
-## 二、core 里比较重要的模块（按推荐学习顺序）
+二、core 里比较重要的模块（按推荐学习顺序）
 
 ### 1. 连接池核心：`pool` 包（优先）
 
@@ -261,9 +360,7 @@ try {
 - **为什么先学**：Starter 的 `DruidDataSourceWrapper` 继承的就是 `DruidDataSource`，`afterPropertiesSet()` 最后调用的 `init()` 就在 pool 里；先搞清「池怎么建、连接怎么借还」，后面 Filter/统计 才好对上号。
 - **建议**：从 `DruidDataSource#init()` 和 `getConnection()` 两条线跟进去，再看 `DruidAbstractDataSource` 的配置项和 `filters` 如何被调用。
 
----
-
-### 2. Filter 机制：`filter` 包（与 Starter 的 DruidFilterConfiguration 衔接）
+2. Filter 机制：`filter` 包（与 Starter 的 DruidFilterConfiguration 衔接）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/filter/`
 - **核心**：
@@ -277,9 +374,7 @@ try {
 - **为什么第二学**：Starter 里只是「按配置注册 Filter Bean」并交给 `DruidDataSourceWrapper#autoAddFilters`；真正「何时、以什么顺序、在连接/语句哪一环节调用」都在 core 的 Filter 链里。
 - **建议**：看 `FilterChainImpl` 里 connection/statement 的调用顺序，再选一个 `StatFilter` 或 `Slf4jLogFilter` 跟一遍完整调用链。
 
----
-
-### 3. 统计体系：`stat` 包（监控数据从哪来）
+3. 统计体系：`stat` 包（监控数据从哪来）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/stat/`
 - **核心**：
@@ -290,9 +385,7 @@ try {
 - **与 Starter 的关系**：Starter 打开的「Stat 监控页」和「SQL 统计」的数据，都来自这些类；StatFilter 在 Filter 链里把执行信息写入这里。
 - **建议**：先搞清楚「一次 SQL 执行后，StatFilter 如何更新 JdbcSqlStat」，再看 `DruidStatService` / `DruidStatManagerFacade` 如何被 StatViewServlet 使用。
 
----
-
-### 4. 监控页与 Web 统计：`support/http` 包（和 Starter 的 StatViewServlet/WebStatFilter 对应）
+4. 监控页与 Web 统计：`support/http` 包（和 Starter 的 StatViewServlet/WebStatFilter 对应）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/support/http/`
 - **核心**：
@@ -301,9 +394,7 @@ try {
 - **support/http/stat**：WebAppStat、WebRequestStat 等，供 WebStatFilter 和监控页「Web 应用」等维度使用。
 - **建议**：对照 Starter 里 `statViewServletRegistrationBean` 设置的 init 参数，在 `ResourceServlet`/`StatViewServlet` 里看 allow、deny、loginUsername、loginPassword、resetEnable 如何被读取和使用。
 
----
-
-### 5. Wall 防 SQL 注入：`wall` 包（可选但很实用）
+5. Wall 防 SQL 注入：`wall` 包（可选但很实用）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/wall/`
 - **核心**：
@@ -313,9 +404,7 @@ try {
 - **依赖**：会用到 **`sql`** 包的解析结果（AST），所以 Wall 可以顺带让你接触到「Druid 的 SQL 解析」。
 - **建议**：先看 `WallFilter` 在链中的调用点，再看一次合法 SQL 和一次非法 SQL 分别如何被放行/拒绝；若对「如何识别注入」感兴趣，再深入 `WallProvider` + `sql` 包。
 
----
-
-### 6. Spring AOP 统计：`support/spring/stat` 包（和 Starter 的 DruidSpringAopConfiguration 对应）
+6. Spring AOP 统计：`support/spring/stat` 包（和 Starter 的 DruidSpringAopConfiguration 对应）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/support/spring/stat/`
 - **核心**：
@@ -323,17 +412,13 @@ try {
   - **`SpringMethodStat`** 等：方法级统计数据结构。
 - **建议**：在学完 `stat` 包后，看 `DruidStatInterceptor` 如何与 `stat` 体系挂钩，以及监控页「Spring 监控」数据从哪来。
 
----
-
-### 7. SQL 解析：`sql` 包（按需深入）
+7. SQL 解析：`sql` 包（按需深入）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/sql/`
 - **内容**：各数据库方言的 Lexer、Parser、Visitor（如 `sql/dialect/mysql`），Wall 和统计里的「SQL 归一化」会用到。
 - **建议**：先不系统学，等看 Wall 或「慢 SQL 合并统计」时，再按需看 `SQLUtils`、Parser 入口和 AST 结构。
 
----
-
-## 三、建议的后续学习顺序（结合你已完成的自动配置）
+三、建议的后续学习顺序（结合你已完成的自动配置）
 
 1. **pool**：`DruidAbstractDataSource` → `DruidDataSource`（`init()`、`getConnection()`、`filters`），建立「池 + Filter 链」的整体图景。  
 2. **filter**：`Filter`/`FilterChainImpl` → `StatFilter`（或一个 LogFilter），理解 Starter 里注册的 Filter 是如何被调用的。  
