@@ -212,11 +212,81 @@ try {
 
 ### 2、获取连接
 
-入口：com.alibaba.druid.pool.DruidDataSource#getConnection()
+入口：com.alibaba.druid.pool.DruidDataSource#getConnection(long)
+
+
+
+
+
+
 
 ```
 
+    flowchart TD
+    
+    subgraph "获取数据库连接"
+        OP1_1["保证获取连接时数据源已初始化: init();"]
+        C1_2{"Filter链数量 > 0"}
+        OP1_3["DruidDataSource#getConnectionDirect;直接获取数据库连接"]
+        OP1_4["结束"]
+        
+    end
+
+    subgraph 直接获取数据库连接
+        OP2_1["保证获取连接时数据源已初始化: init();"]
+    end
+
+    subgraph "通过Filter链获取数据库连接"
+        OP3_1["DruidDataSource#createChain;获取Filter链(FilterChainImpl)"]
+        OP3_2["FilterChainImpl#dataSource_connect;"]
+        C3_3{"判断链上是否还有Filter"}
+        OP3_4["Filter#dataSource_getConnection;过滤器自定义操作实现"]
+        OP3_5["DruidDataSource#getConnectionDirect;直接获取数据库连接"]
+        OP3_6["DruidDataSource#recycleFilterChain;归还Filter链(FilterChainImpl)"]
+    end
+
+    OP1_1 --> C1_2
+     C1_2 --> |N| OP1_3
+     OP1_3 --> OP1_4
+    
+
+    OP1_3 -.- 直接获取数据库连接
+    
+
+    C1_2 --> |Y| OP3_1
+    OP3_1 --> OP3_2
+    OP3_2 --> C3_3
+    C3_3 --> |Y| OP3_4
+    OP3_4 --> OP3_2
+    C3_3 --> |N| OP3_5
+    OP3_5 -.- 直接获取数据库连接
+    OP3_5 --> OP3_6
+
+
+    
+     
+     
 ```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -341,6 +411,20 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 
 
 
+
+
+
+
+### 3、销毁连接
+
+
+
+
+
+
+
+
+
 ## 📖 参考文档
 
 - 官方文档：https://github.com/alibaba/druid/wiki/%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98
@@ -439,11 +523,7 @@ try {
 
 ## 📖学习路径
 
-结合当前仓库结构，下面按「重要模块 + 推荐学习顺序」整理，方便你在完成 `DruidDataSourceAutoConfigure` 之后继续深入。
-
----
-
-# Druid 项目重要模块与后续学习建议
+Druid 项目重要模块与后续学习建议
 
 一、项目整体结构（你当前看到的）
 
@@ -459,7 +539,7 @@ try {
 
 二、core 里比较重要的模块（按推荐学习顺序）
 
-### 1. 连接池核心：`pool` 包（优先）
+1. 连接池核心：`pool` 包（优先）
 
 - **路径**：`core/src/main/java/com/alibaba/druid/pool/`
 - **核心类**：

@@ -466,6 +466,10 @@ public class FilterChainImpl implements FilterChain {
                 .nativeSQL(sql);
     }
 
+    /**
+     * 获取当前位置（pos）的 Filter 并将 pos 加一
+     * @return
+     */
     private Filter nextFilter() {
         return getFilters()
                 .get(pos++);
@@ -5063,14 +5067,38 @@ public class FilterChainImpl implements FilterChain {
         connection.recycle();
     }
 
+    /**
+     * 在“获取连接”这条链上，按顺序递归经过每个 Filter（统计、日志、Wall 等）
+     * 最后落到真正从池里拿连接的 dataSource.getConnectionDirect(maxWaitMillis)
+     *
+     * 实现：链是用同一个 FilterChainImpl 实例 + 不断递增的 pos 实现的：每次 dataSource_connect 被调用时，若还有下一个 Filter，
+     * 就调下一个 Filter 的 dataSource_getConnection(chain, dataSource, maxWaitMillis)，
+     * 并把当前这条 chain（pos 已经 +1）传下去；若没有下一个 Filter，就调 dataSource.getConnectionDirect(maxWaitMillis)
+     *
+     * @param dataSource 数据源
+     * @param maxWaitMillis 最大等待实际
+     * @return 连接
+     * @throws SQLException
+     */
     @Override
     public DruidPooledConnection dataSource_connect(DruidDataSource dataSource,
                                                     long maxWaitMillis) throws SQLException {
+
+        /**
+         * 判断链上是否还有 Filter
+         * 参数：
+         * pos：当前在链上的位置（第几个 Filter），从 0 开始
+         * filterSize：Filter 个数，构造时 getFilters().size()
+         */
         if (this.pos < filterSize) {
+            // nextFilter()：取当前位置的 Filter 并把 pos 加一
+            // pos由FilterCHainImpl维护，并通过参数向下传递给Filter实现类的dataSource_getConnection方法
+            // 下次再通过Filter进 dataSource_connect 时就是下一个 Filter了
             DruidPooledConnection conn = nextFilter().dataSource_getConnection(this, dataSource, maxWaitMillis);
             return conn;
         }
 
+        // 直接调数据源拿连接
         return dataSource.getConnectionDirect(maxWaitMillis);
     }
 

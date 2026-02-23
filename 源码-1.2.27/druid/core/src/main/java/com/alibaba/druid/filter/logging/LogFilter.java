@@ -917,7 +917,7 @@ public abstract class LogFilter extends FilterEventAdapter implements LogFilterM
         ConnectionProxy connection = (ConnectionProxy) conn.getConnectionHolder().getConnection();
 
         if (connectionConnectAfterLogEnable && isConnectionLogEnabled()) {
-            connectionLog("{conn-" + connection.getId() + "} pool-connect");
+            connectionLog("{conn-" + connection.getId() + "}  -connect");
         }
 
         return conn;

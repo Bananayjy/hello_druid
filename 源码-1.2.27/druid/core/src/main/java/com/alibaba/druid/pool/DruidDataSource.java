@@ -1474,6 +1474,8 @@ public class DruidDataSource extends DruidAbstractDataSource
             FilterChainImpl filterChain = createChain();
             try {
                 // 在链上调用 dataSource_connect(this, maxWaitMillis)
+                // 递归调用，最终调用DruidDataSource#getConnectionDirect(maxWaitMillis);
+                // 再递归调用链路上可以进行一些其他操作
                 return filterChain.dataSource_connect(this, maxWaitMillis);
             } finally {
                 // 用完后 recycleFilterChain(filterChain) 归还链
