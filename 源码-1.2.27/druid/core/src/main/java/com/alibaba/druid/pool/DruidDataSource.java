@@ -1506,7 +1506,7 @@ public class DruidDataSource extends DruidAbstractDataSource
     public DruidPooledConnection getConnectionDirect(long maxWaitMillis) throws SQLException {
         // 连接数不满情况下的重试次数
         int notFullTimeoutRetryCnt = 0;
-        // 用 for (;;) 循环，只有拿到“通过校验”的连接才 return；不合格就丢弃并 continue 再取一根
+        // 用 for (;;) 循环，只有拿到“通过校验”的连接才 return；不合格就丢弃并 continue 再取一个
         for (; ; ) {
             // handle notFullTimeoutRetry
             DruidPooledConnection poolableConnection;
