@@ -315,6 +315,30 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 
 
 
+整体交互：
+
+```
+线程 A（取连接）                    共享状态（池）                线程 B（建连/回收）
+    |                                    |                              |
+    | lock.lock()                        |                              |
+    | 看池：空 → 不满足                   |                              |
+    | notEmpty.await()  ──────────────→ 释放 lock，A 挂起在 notEmpty 上   |
+    |                                    |                              |
+    |                                    |  lock.lock()                 |
+    |                                    |  建连/回收，放入池            |
+    |                                    |  notEmpty.signal()  ──────→ 唤醒 A
+    |                                    |  lock.unlock()               |
+    |  被唤醒，竞争到 lock，await 返回     |                              |
+    |  再次检查：池非空，取走连接          |                              |
+    |  lock.unlock()                     |                              |
+```
+
+- await：A 在“条件不满足”时释放锁并挂起，把 CPU 和锁让给 B。
+
+- signal：B 在“让条件满足”后唤醒 A，A 醒来后抢锁、再检查条件、继续工作。
+
+- 这就是 Condition 通过 await 和 signal 实现线程间交互 的典型方式。
+
 
 
 ## 📖 参考文档
@@ -322,6 +346,92 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 - 官方文档：https://github.com/alibaba/druid/wiki/%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98
 
 - https://www.cnblogs.com/jingzh/p/16216411.html#13-%E9%85%8D%E7%BD%AE%E7%9B%B8%E5%85%B3%E5%B1%9E%E6%80%A7
+
+
+
+
+
+## 📖 补充知识点
+
+### 1、java.util.concurrent.locks.Condition
+
+Condition 来自 java.util.concurrent.locks，和 Lock 配合使用，用来做“条件等待”：
+
+- 某线程在持有同一把 Lock 的前提下，发现“条件不满足”就释放锁并挂起（await）；
+
+- 别的线程在满足条件后、持有同一把 Lock 时，唤醒在等这个条件的线程（signal / signalAll）
+
+可以理解为：synchronized + wait/notify 的升级版，但一个 Lock 可以对应多个 Condition，语义更清晰：
+
+| 能力         | synchronized + wait/notify     | Lock + Condition                            |
+| :----------- | :----------------------------- | :------------------------------------------ |
+| 多个等待条件 | 一个对象只有一个等待队列       | 一个 Lock 可 newCondition() 多次            |
+| 可中断等待   | wait() 可被中断                | await() 同样，还提供 awaitUninterruptibly() |
+| 超时等待     | wait(timeout)                  | await(time, unit) 等                        |
+| 使用前提     | 持有对象监视器（synchronized） | 持有对应的 Lock                             |
+
+Condition 必须和某一把 Lock 绑定，由 Lock 创建：Condition cond = lock.newCondition(); 调用 cond.await() / cond.signal() / cond.signalAll() 时，当前线程必须已经持有创建该 Condition 的那把 lock，否则会抛 IllegalMonitorStateException。所以：“谁在等、谁在唤醒” 都是在对同一把 lock 保护的共享状态做判断后，通过 Condition 来挂起/唤醒，实现线程间协作。
+
+1.await：释放锁并挂起，被唤醒后重新抢锁
+
+```
+// 伪代码（当前线程已持有 lock）
+lock.lock();
+try {
+    while (!条件满足) {
+        condition.await();  // 1. 释放 lock  2. 当前线程挂起
+                            // 3. 被 signal 唤醒后，先重新竞争 lock，抢到后才从 await 返回
+    }
+    // 条件满足，继续做事
+} finally {
+    lock.unlock();
+}
+```
+
+要点：
+
+- await() 会做三件事：
+
+  - 释放当前持有的 lock（所以别的线程可以拿到锁去改状态、再 signal）；
+
+  - 当前线程在这个 Condition 上进入等待队列，挂起；
+
+  - 被 signal/signalAll 唤醒后，不会立刻返回，而是要先重新竞争这把 lock，抢到锁之后 await 才返回。
+
+- 返回后，线程再次持有 lock，所以可以安全地再次检查“条件是否真的满足”（一般用 while 而不是 if，防止虚假唤醒）。
+
+- 因此：“通过 await 实现交互” = 当前线程暂时放弃锁并睡觉，等别人改好状态并 signal，自己醒来后重新拿锁再往下执行。
+
+
+
+2.signal / signalAll：唤醒在等这个 Condition 的线程
+
+```
+// 另一个线程（也已持有同一把 lock）
+lock.lock();
+try {
+    // 修改共享状态，使“条件”满足
+    状态 = 已满足;
+    condition.signal();   // 或 signalAll()
+    // 唤醒一个（signal）或全部（signalAll）在该 condition 上 await 的线程
+} finally {
+    lock.unlock();
+}
+```
+
+要点：
+
+- signal()：从该 Condition 的等待队列里移出一个线程，让它去竞争 lock；那个线程在 await 里被唤醒后，会去抢 lock，抢到后 await 返回。
+
+- signalAll()：唤醒所有在该 Condition 上等待的线程，它们都会去竞争 lock，一般只有一个能先拿到锁，其余继续等 lock。
+
+- 调用 signal/signalAll 时不会释放 lock：只是“通知”，当前线程仍然持有锁，通常会在 unlock 之后，被唤醒的线程才有机会抢到锁并从 await 返回。
+
+- 因此：“通过 signal 实现交互” = 在改完共享状态后，通知“等这个条件”的线程：“条件可能满足了，你们可以醒过来重新抢锁、再检查条件”。
+
+
+
+
 
 
 

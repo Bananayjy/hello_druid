@@ -402,9 +402,9 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     public DruidAbstractDataSource(boolean lockFair) {
         // 创建ReentrantLock
         lock = new ReentrantLock(lockFair);
-        //
+        // 创建线程不为空条件
         notEmpty = lock.newCondition();
-        //
+        // 创建线程为空条件
         empty = lock.newCondition();
     }
 
