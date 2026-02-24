@@ -10,15 +10,7 @@
 
 ## 🎯 项目概述
 
-
-
 ## 📁 项目结构分析
-
-```
-
-```
-
-
 
 ## 🧪 使用示例
 
@@ -32,7 +24,6 @@
 
 - mybatis-plus-boot-starter：3.5.2
 
-  
 
 ### 2、环境搭建
 
@@ -212,11 +203,12 @@ try {
 
 ### 2、获取连接
 
-入口：com.alibaba.druid.pool.DruidDataSource#getConnection(long)
+相关类：
 
+- com.alibaba.druid.pool.DruidDataSource#getConnection(long)：获取连接（直接建连，从池中获取）
+- CreateConnectionThread：向池中补连
 
-
-
+![mermaid-diagram-2026-02-24-121951](Y:\香蕉宝宝\Do\数据库相关\hello_druid\文档\druid学习文档.assets\mermaid-diagram-2026-02-24-121951.png)
 
 
 
@@ -230,29 +222,46 @@ try {
         OP1_3["DruidDataSource.getConnectionDirect;直接获取数据库连接"]
     end
 
-    subgraph 直接获取数据库连接
+    subgraph DruidDataSource.getConnectionDirect
         subgraph "for循环,直到获取合法连接"
             OP2_1["DruidDataSource.getConnectionInternal;获取DruidPooledConnection，以及失败后重试"]
             OP2_2["借出校验与泄漏追踪"]
+            OP2_3["返回借出连接"]
+        end
+    end
+
+    subgraph DruidDataSource.getConnectionInternal
+        direction TB
+         OP4_1["前置检查，保证在池未关闭、未禁用时才继续取连接"]
+          subgraph "for循环,直到获取连接"
+            OP4_2["createDirect=true，直接通过createPhysicalConnection建连，通过CAS避免重复建连，加锁维护连接数，并将createDirect设置为false"]
+            OP4_3["通过pollLast和takeLast从池中获取连接，如果连接数不够，唤醒 CreateConnectionThread，让它去建连并放入池"]
+            OP4_4["对获取的连接进行校验、后置处理，并封装成DruidPooledConnection对象"]
         end
     end
 
     subgraph "通过Filter链获取数据库连接"
-        OP3_1["DruidDataSource#createChain;获取Filter链(FilterChainImpl)"]
-        OP3_2["FilterChainImpl#dataSource_connect;"]
+        OP3_1["DruidDataSource.createChain;获取Filter链(FilterChainImpl)"]
+        OP3_2["FilterChainImpl。dataSource_connect;"]
         C3_3{"判断链上是否还有Filter"}
-        OP3_4["Filter#dataSource_getConnection;过滤器自定义操作实现"]
-        OP3_5["DruidDataSource#getConnectionDirect;直接获取数据库连接"]
-        OP3_6["DruidDataSource#recycleFilterChain;归还Filter链(FilterChainImpl)"]
+        OP3_4["Filter.dataSource_getConnection;过滤器自定义操作实现"]
+        OP3_5["DruidDataSource.getConnectionDirect;直接获取数据库连接"]
+        OP3_6["DruidDataSource.recycleFilterChain;归还Filter链(FilterChainImpl)"]
     end
 
     OP1_1 --> C1_2
     C1_2 --> |N| OP1_3
     
 
-    OP1_3 -.- 直接获取数据库连接
+    OP1_3 -.- DruidDataSource.getConnectionDirect
 
+    OP2_1 -.- DruidDataSource.getConnectionInternal
     OP2_1 --> OP2_2
+    OP2_2 --> OP2_3
+
+    OP4_1 --> OP4_2
+    OP4_2 --> OP4_3
+    OP4_3 --> OP4_4
     
 
     C1_2 --> |Y| OP3_1
@@ -261,38 +270,10 @@ try {
     C3_3 --> |Y| OP3_4
     OP3_4 --> OP3_2
     C3_3 --> |N| OP3_5
-    OP3_5 -.- 直接获取数据库连接
+    OP3_5 -.- DruidDataSource.getConnectionDirect
     OP3_5 --> OP3_6
 
-
-    
-     
-     
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -413,11 +394,99 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 
 
 
+### 4、关闭连接
 
 
 
 
-### 3、销毁连接
+
+### 4、销毁连接（线程方式）
+
+相关类：com.alibaba.druid.pool.DruidDataSource.DestroyConnectionThread
+
+![mermaid-diagram-2026-02-24-183535](Y:\香蕉宝宝\Do\数据库相关\hello_druid\文档\druid学习文档.assets\mermaid-diagram-2026-02-24-183535.png)
+
+```
+
+    flowchart TD
+    
+    subgraph "DestroyConnectionThread.run"
+        direction TB
+        OP1_1["initedLatch.countDown;通知 init 线程销毁线程已就绪"]
+        subgraph "for循环并且线程不中断"
+        direction TB
+            OP2_1["数据源已关闭或正在关闭，直接退出循环，线程结束，不再执行 DestroyTask"]
+            OP2_2["线程睡眠（可配置）"]
+            OP2_3["睡眠后被中断，sleep 可能清除中断标志，这里再查一次，若被中断则退出循环"]
+        end
+        OP1_2["DestroyTask.run"]
+    end
+
+    OP1_1 --> OP2_1
+    OP2_1 --> OP2_2
+    OP2_2 --> OP2_3
+    OP2_3 --> OP1_2
+    OP1_2 --> DestroyTask.run
+
+    subgraph "DestroyTask.run"
+        direction TB
+        OP3_1["shrink(checkTime, keepAlive);在持锁下扫描空闲池 connections，根据 checkTime / keepAlive 和各项时间阈值，把需要剔除的连接放进 evictConnections、
+        需要保活检测的放进 keepAliveConnections；然后压缩 connections、物理关闭被剔除的连接、对保活连接做校验（通过则 put 回池，失败则丢弃）；
+        若池低于 minIdle 或发生致命错误增量则 emptySignal 触发补连"]
+        OP3_2["根据removeAbandoned值，进行泄漏连接回收"]
+    end
+
+    OP3_1 --> OP3_2
+    OP3_1 -.- shrink
+    OP3_2 -.- removeAbandoned
+
+    
+    subgraph "shrink"
+        direction TB
+        OP4_1["没有空闲连接poolingCount=0，无需收缩，直接返回"]
+        OP4_2["获取主锁，可被中断；被中断则 return，不执行本次 shrink"]
+        OP4_3["数据源未初始化完成则直接 return"]
+
+        subgraph "遍历空闲连接"
+            direction TB
+            OP5_1["处于致命错误状态，或自上次 shrink 以来有新的致命错误，且该连接的建立时间早于最近一次致命错误时间：先放入保活队列"]
+            OP5_2["按时间剔除或按照checkCount数量进行剔除空闲连接,按时间剔除会根据keepAlive对空闲够久的连接定期做一次有效性检测"]
+            OP5_3["根据需要剔除和拿去保活连接数，更新空闲连接数，保留在池connections的连接并进行压缩"]
+            OP5_4["若开启 keepAlive 且 当前池总量 < minIdle，标记needFill需要补连"]
+            OP5_5["物理关闭被剔除的连接"]
+            OP5_6["保活检测与回池/丢弃"]
+            OP5_7["根据needFill决定是不是需要唤醒CreateConnectionThread进行补连"]
+        end
+
+    end
+
+    OP4_1 --> OP4_2
+    OP4_2 --> OP4_3
+    OP4_3 --> 遍历空闲连接
+    OP5_1 --> OP5_2
+    OP5_2 --> OP5_3
+    OP5_3 --> OP5_4
+    OP5_4 --> OP5_5
+    OP5_5 --> OP5_6
+    OP5_6 --> OP5_7
+ 
+
+    subgraph "removeAbandoned"
+        direction TB
+        OP6_1["没有“已借出”的连接（未开 removeAbandoned 时不会往 activeConnections 放，或都已还），直接返回 0，不做后续扫描和关闭"]
+        OP6_2["加锁，遍历“已借出”的连接，未在跑 SQL 且借出超时的连接从 activeConnections 移入 abandonedList"]
+        OP6_3["存在“泄漏”的连接，遍历“泄漏”的连接，关闭连接，并进行泄露回收，并给对应连接打上“已按泄漏回收处理”的标记"]
+        OP6_4["根据配置打泄漏日志"]
+        OP6_5["返回本方法本次回收数"]
+    end
+
+
+    OP6_1 --> OP6_2
+    OP6_2 --> OP6_3
+    OP6_3 --> OP6_4
+    OP6_4 --> OP6_5
+    
+```
 
 
 
@@ -432,6 +501,8 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 - 官方文档：https://github.com/alibaba/druid/wiki/%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98
 
 - https://www.cnblogs.com/jingzh/p/16216411.html#13-%E9%85%8D%E7%BD%AE%E7%9B%B8%E5%85%B3%E5%B1%9E%E6%80%A7
+
+- https://juejin.cn/post/7408147106891235355
 
 
 

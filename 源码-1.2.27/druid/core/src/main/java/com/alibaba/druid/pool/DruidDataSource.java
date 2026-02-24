@@ -126,6 +126,7 @@ public class DruidDataSource extends DruidAbstractDataSource
     private CreateConnectionThread createConnectionThread;
     private DestroyConnectionThread destroyConnectionThread;
     private LogStatsThread logStatsThread;
+    // 已提交、尚未完成的建连任务数
     private int createTaskCount;
 
     private volatile long createTaskIdSeed = 1L;
@@ -3248,40 +3249,58 @@ public class DruidDataSource extends DruidAbstractDataSource
         }
     }
 
+    /**
+     *  Druid 的销毁/回收线程
+     *  1.作用：按固定间隔醒来，执行 DestroyTask（内部调用 shrink 和 removeAbandoned），做空闲连接回收、超时剔除、保活检测以及泄漏连接回收
+     *  2.线程创建时机：仅当 destroyScheduler == null 时才会创建并启动本线程；若配置了 destroyScheduler，则用调度器 scheduleAtFixedRate(destroyTask, period, period)
+     *  定时跑 DestroyTask，不会起 DestroyConnectionThread
+     */
     public class DestroyConnectionThread extends Thread {
+        // 初始化门栓
         private final CountDownLatch initedLatch = new CountDownLatch(1);
 
         public DestroyConnectionThread(String name) {
+            // 线程名称
             super(name);
+            // 守护线程，进程退出时不会因本线程未结束而阻塞
             this.setDaemon(true);
         }
 
+        // 供数据源 init 等待销毁线程就绪用
         public CountDownLatch getInitedLatch() {
             return initedLatch;
         }
 
         public void run() {
+            // 表示销毁线程已启动，init 里等待 initedLatch 的可以返回
             initedLatch.countDown();
 
+            // 只要当前线程未被中断就一直循环；被 interrupt 则退出
             for (; !Thread.currentThread().isInterrupted(); ) {
                 // 从前面开始删除
                 try {
+                    // 数据源已关闭或正在关闭
                     if (closed || closing) {
+                        // 直接退出循环，线程结束，不再执行 DestroyTask
                         break;
                     }
 
+                    // 判断“回收/检测”间隔配置，若配置了大于 0 的间隔，用该值睡眠；否则用默认 1 秒
                     if (timeBetweenEvictionRunsMillis > 0) {
                         Thread.sleep(timeBetweenEvictionRunsMillis);
                     } else {
                         Thread.sleep(1000); //
                     }
 
+                    // 睡眠后被中断，sleep 可能清除中断标志，这里再查一次，若被中断则退出循环
                     if (Thread.interrupted()) {
                         break;
                     }
 
+                    // 执行销毁任务
                     destroyTask.run();
-                } catch (InterruptedException e) {
+                } catch (InterruptedException e) {  // 睡眠或别处抛出的中断
+                    // 收到 InterruptedException 直接退出循环，线程结束。
                     break;
                 }
             }
@@ -3295,8 +3314,10 @@ public class DruidDataSource extends DruidAbstractDataSource
 
         @Override
         public void run() {
+            // 空闲回收、超时剔除、保活
             shrink(true, keepAlive);
 
+            // 泄漏连接回收
             if (isRemoveAbandoned()) {
                 removeAbandoned();
             }
@@ -3327,30 +3348,43 @@ public class DruidDataSource extends DruidAbstractDataSource
         }
     }
 
+    /**
+     * 在开启 removeAbandoned 时，由 DestroyTask 周期性调用，扫描 activeConnections（已借出未归还的连接），把借出时间超过 removeAbandonedTimeoutMillis 且当前未在执行 SQL 的连接视为“泄漏”，
+     * 从 activeConnections 移除、关闭连接并调用 abandond()，可选打泄漏日志（借出栈、当前线程状态与栈），最后返回本轮回收数量。
+     * @return
+     */
     public int removeAbandoned() {
+        // 本方法本次回收的泄漏连接数
         int removeCount = 0;
 
+        // 没有“已借出”的连接（未开 removeAbandoned 时不会往 activeConnections 放，或都已还），直接返回 0，不做后续扫描和关闭
         if (activeConnections.size() == 0) {
             return removeCount;
         }
 
+        // 当前纳秒时间，用来和借出时间算“借出时长”,与 removeAbandonedTimeoutMillis 比较
         long currrentNanos = System.nanoTime();
 
+        // 本轮回合判定为“泄漏”的连接，先放进列表，在释放 activeConnectionLock 之后再统一关闭和打日志，避免在持锁时做 I/O
         List<DruidPooledConnection> abandonedList = new ArrayList<DruidPooledConnection>();
 
+        // 加锁
         activeConnectionLock.lock();
         try {
+            // 遍历“已借出”的连接
             Iterator<DruidPooledConnection> iter = activeConnections.keySet().iterator();
-
             for (; iter.hasNext(); ) {
                 DruidPooledConnection pooledConnection = iter.next();
 
+                // 正在运行的直接跳过
                 if (pooledConnection.isRunning()) {
                     continue;
                 }
 
+                // 借出时长
                 long timeMillis = (currrentNanos - pooledConnection.getConnectedTimeNano()) / (1000 * 1000);
 
+                // 未在跑 SQL 且借出超时的连接从 activeConnections 移入 abandonedList
                 if (timeMillis >= removeAbandonedTimeoutMillis) {
                     iter.remove();
                     pooledConnection.setTraceEnable(false);
@@ -3358,26 +3392,38 @@ public class DruidDataSource extends DruidAbstractDataSource
                 }
             }
         } finally {
+            // 解锁
             activeConnectionLock.unlock();
         }
 
+        // 存在“泄漏”的连接
         if (abandonedList.size() > 0) {
+            // 遍历“泄漏”的连接
             for (DruidPooledConnection pooledConnection : abandonedList) {
+                // 使用连接自己的锁，避免和该连接上其它操作（如 close、statement）并发冲突
                 final ReentrantLock lock = pooledConnection.lock;
+                // 锁
                 lock.lock();
                 try {
+                    // 若连接已被标记为禁用（例如已被关闭或 abandond 过），continue 跳过，不再关第二次
                     if (pooledConnection.isDisable()) {
                         continue;
                     }
                 } finally {
+                    // 解锁
                     lock.unlock();
                 }
 
+                // 关闭连接，并进行泄露回收（物理连接从“借出”变回“空闲池”）
                 JdbcUtils.close(pooledConnection);
+               // 给当前这个 DruidPooledConnection 包装打上“已按泄漏回收处理”的标记
                 pooledConnection.abandond();
+                // 全局统计“泄漏回收”次数
                 removeAbandonedCount++;
+                // 本方法本次回收数，用于 return
                 removeCount++;
 
+                //  根据配置打泄漏日志
                 if (isLogAbandoned()) {
                     StringBuilder buf = new StringBuilder();
                     buf.append("abandon connection, owner thread: ");
@@ -3408,6 +3454,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             }
         }
 
+        // 返回本方法本次回收数
         return removeCount;
     }
 
@@ -3471,11 +3518,20 @@ public class DruidDataSource extends DruidAbstractDataSource
         shrink(checkTime, keepAlive);
     }
 
+    /**
+     * 在持锁下扫描空闲池 connections，根据 checkTime / keepAlive 和各项时间阈值，把需要剔除的连接放进 evictConnections、
+     * 需要保活检测的放进 keepAliveConnections；然后压缩 connections、物理关闭被剔除的连接、对保活连接做校验（通过则 put 回池，失败则丢弃）；
+     * 若池低于 minIdle 或发生致命错误增量则 emptySignal 触发补连
+     * @param checkTime 是否按时间剔除
+     * @param keepAlive 是否保活，为 true 时，对空闲够久的连接会定期做一次有效性检测（执行校验 SQL 或 checker），无效就关掉并丢弃，有效就更新 lastKeepTimeMillis 并放回池
+     */
     public void shrink(boolean checkTime, boolean keepAlive) {
+        // 没有空闲连接，无需收缩，直接返回
         if (poolingCount == 0) {
             return;
         }
 
+        // 获取主锁，可被中断；被中断则 return，不执行本次 shrink
         final Lock lock = this.lock;
         try {
             lock.lockInterruptibly();
@@ -3483,109 +3539,149 @@ public class DruidDataSource extends DruidAbstractDataSource
             return;
         }
 
+        // 后面若发现池低于 minIdle 或保活丢弃导致需补连，会置 true，最后用于 emptySignal唤醒建连线程进行连接创建
         boolean needFill = false;
+        // 本轮回合要剔除的连接数（先放入 evictConnections）
         int evictCount = 0;
+        // 本轮回合要做保活检测的连接数（先放入 keepAliveConnections）
         int keepAliveCount = 0;
+        // 自上次 shrink 以来新增的致命错误次数；非 0 时部分连接会先进入保活队列，且最后可能触发 emptySignal
         int fatalErrorIncrement = fatalErrorCount - fatalErrorCountLastShrink;
+        // 记录本次 shrink 时的致命错误计数，供下次算增量
         fatalErrorCountLastShrink = fatalErrorCount;
 
         try {
+            // 数据源未初始化完成则直接 return
             if (!inited) {
                 return;
             }
 
+            // 若只按数量收缩（不按时间），前 checkCount 个空闲连接可被剔除，使池从 poolingCount 降到 minIdle
             final int checkCount = poolingCount - minIdle;
+            // 当前时间，用于算空闲时长、物理连接存活时长等
             final long currentTimeMillis = System.currentTimeMillis();
+            // 压缩后“保留在池”的连接在新 connections 中的下一个写入下标
             // remaining is the position of the next connection should be retained in the pool.
             int remaining = 0;
+            // 当前遍历到的空闲连接下标
             int i = 0;
+            // 对 connections[i] 依次做以下判断，把连接归入：保留并可能保活、放入 evictConnections（剔除）、放入 keepAliveConnections（保活检测）；或提前 break 结束遍历
             for (; i < poolingCount; ++i) {
+                // 获取线程连接
                 DruidConnectionHolder connection = connections[i];
 
+                // 处于致命错误状态，或自上次 shrink 以来有新的致命错误，且该连接的建立时间早于最近一次致命错误时间：先放入保活队列
                 if ((onFatalError || fatalErrorIncrement > 0) && (lastFatalErrorTimeMillis > connection.connectTimeMillis)) {
+                    // 认为该连接可能是在“坏状态”前建的，先放进 keepAliveConnections 做一次校验；
+                    // 本轮回合不参与后面的“按时间剔除”和“直接保留”逻辑，交给保活逻辑统一校验或丢弃
                     keepAliveConnections[keepAliveCount++] = connection;
                     continue;
                 }
 
-                if (checkTime) {
-                    if (phyTimeoutMillis > 0) {
+                if (checkTime) { // 按时间剔除
+                    // 物理超时
+                    if (phyTimeoutMillis > 0) { // phyTimeoutMillis > 0
                         long phyConnectTimeMillis = currentTimeMillis - connection.connectTimeMillis;
-                        if (phyConnectTimeMillis > phyTimeoutMillis) {
+                        if (phyConnectTimeMillis > phyTimeoutMillis) {  // 连接存活时间 > phyTimeoutMillis
+                            // 连接物理存在时间过长，直接放入 evictConnections，后续进行剔除
                             evictConnections[evictCount++] = connection;
                             continue;
                         }
                     }
 
+                    // 该连接在池中的空闲时长
                     long idleMillis = currentTimeMillis - connection.lastActiveTimeMillis;
 
+                    // 空闲时间很短，既不到“可剔除”阈值，也不到“要保活”间隔；
+                    // 且 connections 按 lastActiveTime 有序（先处理的更空闲），后面连接更新，可直接 break 不再扫
                     if (idleMillis < minEvictableIdleTimeMillis
                             && idleMillis < keepAliveBetweenTimeMillis) {
                         break;
                     }
 
+                    // 空闲超过最小可剔除时间
                     if (idleMillis >= minEvictableIdleTimeMillis) {
-                        if (i < checkCount) {
+                        if (i < checkCount) {   // 再“数量收缩”范围内（前 checkCount 个）
+                            // 放入 evictConnections 剔除
                             evictConnections[evictCount++] = connection;
                             continue;
-                        } else if (idleMillis > maxEvictableIdleTimeMillis) {
+                        } else if (idleMillis > maxEvictableIdleTimeMillis) {   // 超过最大可空闲时间
+                            // 放入 evictConnections 剔除
                             evictConnections[evictCount++] = connection;
                             continue;
                         }
                     }
 
+                    // 保活（需要对空闲够久的连接会定期做一次有效性检测） 且 空闲时间大于保活间间隔 且 上次保活时间间隔大于保活间隔时间
                     if (keepAlive && idleMillis >= keepAliveBetweenTimeMillis
                             && currentTimeMillis - connection.lastKeepTimeMillis >= keepAliveBetweenTimeMillis) {
+                        // 放入 keepAliveConnections，后面统一做校验
                         keepAliveConnections[keepAliveCount++] = connection;
                     } else {
                         if (i != remaining) {
+                            // 该连接保留在池中并参与后续压缩
                             // move the connection to the new position for retaining it in the pool.
                             connections[remaining] = connection;
                         }
                         remaining++;
                     }
                 } else {
-                    if (i < checkCount) {
+                    if (i < checkCount) {   // 在“多出来的”那部分里，放入 evictConnections 剔除，使池从 poolingCount 降到 minIdle
                         evictConnections[evictCount++] = connection;
-                    } else {
+                    } else {    // 已保留够 minIdle 个，后面不用再看，break
                         break;
                     }
                 }
             }
 
             // shrink connections by HotSpot intrinsic function _arraycopy for performance optimization.
+            // 本轮回合从池中“移出”的连接数（剔除 + 拿去保活）
             int removeCount = evictCount + keepAliveCount;
             if (removeCount > 0) {
+                // 循环 break 时尚未被处理的连接数（从 i 到 poolingCount-1），这些连接是“保留”的
                 int breakedCount = poolingCount - i;
                 if (breakedCount > 0) {
+                    // 把未处理的那段保留连接搬到新位置 [remaining, remaining+breakedCount)，前面 [0, remaining) 已在循环里填好
                     // retains the connections that start at the break position.
                     System.arraycopy(connections, i, connections, remaining, breakedCount);
+                    // 压缩后有效连接数 = remaining
                     remaining += breakedCount;
                 }
+                // 把被移出的槽位清空（用 nullConnections 的 null 覆盖），避免残留引用。
                 // clean the old references of the connections that have been moved forward to the new positions.
                 System.arraycopy(nullConnections, 0, connections, remaining, removeCount);
+                // 更新空闲连接数
                 poolingCount -= removeCount;
             }
+            // 统计本轮回合做保活检测的数量
             keepAliveCheckCount += keepAliveCount;
 
+            // 若开启 keepAlive 且 当前池总量 < minIdle，标记需要补连
             if (keepAlive && poolingCount + activeCount < minIdle) {
                 needFill = true;
             }
         } finally {
+            // 无论是否移除连接，都释放锁
             lock.unlock();
         }
 
+        // 物理关闭被剔除的连接
         if (evictCount > 0) {
+            // 对 evictConnections 里每个 holder 取底层 Connection 并 close，destroyCount 加一
             for (int i = 0; i < evictCount; ++i) {
                 DruidConnectionHolder item = evictConnections[i];
                 Connection connection = item.getConnection();
                 JdbcUtils.close(connection);
                 destroyCountUpdater.incrementAndGet(this);
             }
+            // 最后用 nullConnections 清空 evictConnections 槽位，便于下次复用
             // use HotSpot intrinsic function _arraycopy for performance optimization.
             System.arraycopy(nullConnections, 0, evictConnections, 0, evictConnections.length);
         }
 
+        // 保活检测与回池/丢弃
         if (keepAliveCount > 0) {
+            // 倒序遍历，从 keepAliveCount-1 到 0，保持与放入顺序一致（“先放入的先处理”）
             // keep order
             for (int i = keepAliveCount - 1; i >= 0; --i) {
                 DruidConnectionHolder holder = keepAliveConnections[i];
@@ -3594,6 +3690,7 @@ public class DruidDataSource extends DruidAbstractDataSource
 
                 boolean validate = false;
                 try {
+                    // 用 ValidConnectionChecker 或 validationQuery 校验连接是否有效；抛异常则 validate = false。
                     this.validateConnection(connection);
                     validate = true;
                 } catch (Throwable error) {
@@ -3605,6 +3702,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                 }
 
                 boolean discard = !validate;
+                // 更新 lastKeepTimeMillis，put(holder, 0L, true) 把连接放回池；若 put 失败（池满/关闭等）则 discard = true。
                 if (validate) {
                     holder.lastKeepTimeMillis = System.currentTimeMillis();
                     boolean putOk = put(holder, 0L, true);
@@ -3613,6 +3711,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                     }
                 }
 
+                // 关闭底层 connection 和 holder.socket，持锁设置 holder.discard = true、discardCount++；若此时池低于 minIdle 则 needFill = true。
                 if (discard) {
                     try {
                         connection.close();
@@ -3641,6 +3740,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                         holder.discard = true;
                         discardCount++;
 
+                        // 当前“已经有的 + 正在路上的”连接数（估算） 小于 希望池里至少保留的空闲数 minIdle
                         if (activeCount + poolingCount + createTaskCount < minIdle) {
                             needFill = true;
                         }
@@ -3650,10 +3750,12 @@ public class DruidDataSource extends DruidAbstractDataSource
                 }
             }
             this.getDataSourceStat().addKeepAliveCheckCount(keepAliveCount);
+            // 用 nullConnections 清空数组，供下次 shrink 复用。
             // use HotSpot intrinsic function _arraycopy for performance optimization.
             System.arraycopy(nullConnections, 0, keepAliveConnections, 0, keepAliveConnections.length);
         }
 
+        // 补连
         if (needFill) {
             lock.lock();
             try {

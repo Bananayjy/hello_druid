@@ -220,6 +220,7 @@ public abstract class DruidAbstractDataSource extends WrapperAdapter implements 
     protected volatile int numTestsPerEvictionRun = DEFAULT_NUM_TESTS_PER_EVICTION_RUN;
     protected volatile long minEvictableIdleTimeMillis = DEFAULT_MIN_EVICTABLE_IDLE_TIME_MILLIS;
     protected volatile long maxEvictableIdleTimeMillis = DEFAULT_MAX_EVICTABLE_IDLE_TIME_MILLIS;
+    // 保活时间间隔（毫秒），表示“至少隔多久做一次保活检测”。空闲时间或距上次保活时间至少要达到这个间隔，才会把连接放进保活队列去校验
     protected volatile long keepAliveBetweenTimeMillis = DEFAULT_TIME_BETWEEN_EVICTION_RUNS_MILLIS * 2;
     protected volatile long phyTimeoutMillis = DEFAULT_PHY_TIMEOUT_MILLIS;
     protected volatile long phyMaxUseCount = -1;

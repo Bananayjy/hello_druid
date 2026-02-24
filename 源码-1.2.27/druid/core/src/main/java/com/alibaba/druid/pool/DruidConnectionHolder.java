@@ -62,6 +62,7 @@ public final class DruidConnectionHolder {
     protected final long connectTimeMillis;
     protected volatile long lastActiveTimeMillis;
     protected volatile long lastExecTimeMillis;
+    // 这条连接上一次通过保活检测的时间（毫秒）
     protected volatile long lastKeepTimeMillis;
     protected volatile long lastValidTimeMillis;
     protected long useCount;
