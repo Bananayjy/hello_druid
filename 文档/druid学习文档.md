@@ -394,7 +394,11 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 
 
 
-### 4、关闭连接
+### 3、关闭连接
+
+相关类：com.alibaba.druid.pool.DruidPooledConnection#close
+
+
 
 
 

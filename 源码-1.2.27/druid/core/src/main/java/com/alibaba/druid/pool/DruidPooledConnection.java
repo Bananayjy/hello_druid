@@ -234,35 +234,56 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
 
     @Override
     public void close() throws SQLException {
+        // 当前连接已经关闭，直接return，避免重复关闭
         if (this.disable) {
             return;
         }
 
+        // 获取连接持有者对象
         DruidConnectionHolder holder = this.holder;
+        // 如果持有者对象为空，则直接return
         if (holder == null) {
+            // 如果dupCloseLogEnable=true。打印日志
             if (dupCloseLogEnable) {
                 LOG.error("dup close");
             }
             return;
         }
 
+        // 获取当前数据源
         DruidAbstractDataSource dataSource = holder.getDataSource();
+
+        // 判断当前连接和借走时的线程是不是同一个线程
+        // 默认假设“谁借谁还、同线程”，所以同线程 close 可以走无锁快速路径；一旦发现跨线程 close，就通过 asyncCloseConnectionEnable 把整库的 close 策略升级为持锁路径，用一点性能换并发安全
         boolean isSameThread = this.ownerThread == Thread.currentThread();
 
+        // 不是同一个线程，将数据源的 asyncCloseConnectionEnable 设置为 true
         if (!isSameThread) {
             dataSource.setAsyncCloseConnectionEnable(true);
         }
 
+        /**
+         * 跨线程close，需要加锁，和下面逻辑一样，只不过加了连接自己的lock锁，避免在 removeAbandoned 或跨线程 close 时，出现“连接已被回池但原持有者还在用”的并发问题
+         * 加锁意义：这里的锁是连接自己的 lock（和 holder 共用），和 getStatement、execute 等“使用这条连接”的操作用的是同一把锁
+         * 无锁路径只保证了：多条线程同时 close 同一条连接 时，只有一条能 CAS 成功并执行 recycle，其它线程静默返回，不会重复 putLast、重复 activeCount--。
+         * 它没有保证：“正在用这条连接的线程” 和 “正在 close 这条连接的线程” 之间的互斥。（保证多个线程close时候的互斥，没有保证其他使用这个连接操作和close操作的互斥）
+         * 持锁路径（syncClose） 保证：从 lock.lock() 到 lock.unlock() 之间，只有这一条线程 能执行“关闭 + 回收”；其它任何要使用这条连接的操作（例如在同一条连接上 getStatement、execute），
+         * 也需要这把锁，因此要么在 close 之前做完，要么等 close 做完再做。
+         * 也就是说：“关这条连接”和“用这条连接”被串行化了。
+         */
         if (dataSource.removeAbandoned || dataSource.asyncCloseConnectionEnable) {
             syncClose();
             return;
         }
 
+        // 通过对CLOSING_UPDATER的CAS操作只允许一条线程执行“监听器 + recycle”，其它线程 CAS 失败就静默返回，不再动池
+        // 保证无锁路径下的单次关闭互斥，触发情况下，肯定有线程经过syncClose里的CAS操作
         if (!CLOSING_UPDATER.compareAndSet(this, 0, 1)) {
             return;
         }
 
         try {
+            // 监听器
             for (int i = 0; i < holder.connectionEventListeners.size(); i++) {
                 ConnectionEventListener listener = holder.connectionEventListeners.get(i);
                 listener.connectionClosed(new ConnectionEvent(this));
@@ -270,6 +291,7 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
 
             List<Filter> filters = dataSource.filters;
             int filtersSize = filters.size();
+            // 存在链情况下的关闭连接，和获取连接同理
             if (filtersSize > 0) {
                 FilterChainImpl filterChain = holder.createChain();
                 try {
@@ -281,9 +303,11 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
                 recycle();
             }
         } finally {
+            // 异常时也要还原，避免连接卡在“正在关闭”且未完成回收的中间状态
             CLOSING_UPDATER.set(this, 0);
         }
 
+        // 设置当前连接关闭状态为true
         this.disable = true;
     }
 
@@ -316,6 +340,7 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
                 FilterChainImpl filterChain = new FilterChainImpl(dataSource);
                 filterChain.dataSource_recycle(this);
             } else {
+                // 回收连接
                 recycle();
             }
 
@@ -326,12 +351,19 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
         }
     }
 
+    /**
+     * 回收连接
+     * 作用：把这条“已借出”连接收回来：要么 putLast 回空闲池，要么 discardConnection 丢弃，并维护 activeCount、closeCount、activeConnections 等
+     * @throws SQLException
+     */
     public void recycle() throws SQLException {
+        // 连接已禁用（例如已关过），避免重复回收
         if (this.disable) {
             return;
         }
 
         DruidConnectionHolder holder = this.holder;
+        // 没有 holder（已在上次 recycle 清空或异常），无法调用 dataSource.recycle，直接返回
         if (holder == null) {
             if (dupCloseLogEnable) {
                 LOG.error("dup close");
@@ -339,10 +371,13 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
             return;
         }
 
+        // 只有未被标记为“泄漏回收”的才调数据源回收；
+        // removeAbandoned 里先 close（会走到这里、做一次回收）再 abandond()，避免同一条连接被 dataSource.recycle 两次。
         if (!this.abandoned) {
             holder.dataSource.recycle(this);
         }
 
+        // 无论是否调了 dataSource.recycle，都与连接解耦并标记已关闭，保证状态一致
         this.holder = null;
         conn = null;
         transactionInfo = null;

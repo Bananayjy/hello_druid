@@ -2148,16 +2148,21 @@ public class DruidDataSource extends DruidAbstractDataSource
      * 回收连接
      */
     protected void recycle(DruidPooledConnection pooledConnection) throws SQLException {
+        // 取 holder
         final DruidConnectionHolder holder = pooledConnection.holder;
 
+        // 空则只打日志并 return（
         if (holder == null) {
             LOG.warn("connectionHolder is null");
             return;
         }
 
+        // 当前是否处于“允许跨线程关闭”或“泄漏检测”模式
         boolean asyncCloseConnectionEnable = this.removeAbandoned || this.asyncCloseConnectionEnable;
+        // 当前线程是否为借出该连接的线程
         boolean isSameThread = pooledConnection.ownerThread == Thread.currentThread();
 
+        // logDifferentThread 且非 async 且跨线程时打“借/还不同线程”的 warn，便于发现不规范用法
         if (logDifferentThread //
                 && (!asyncCloseConnectionEnable) //
                 && !isSameThread
@@ -2165,36 +2170,45 @@ public class DruidDataSource extends DruidAbstractDataSource
             LOG.warn("get/close not same thread");
         }
 
+        // 获取底层 JDBC Connection，后续用于 isClosed、testOnReturn、关闭等
         final Connection physicalConnection = holder.conn;
 
+        // 若该池化连接参与了泄漏追踪
         if (pooledConnection.traceEnable) {
             Object oldInfo = null;
             activeConnectionLock.lock();
             try {
                 if (pooledConnection.traceEnable) {
+                    // 从 activeConnections 移除
                     oldInfo = activeConnections.remove(pooledConnection);
+                    // 并置 traceEnable=false
                     pooledConnection.traceEnable = false;
                 }
             } finally {
                 activeConnectionLock.unlock();
             }
-            if (oldInfo == null) {
+            if (oldInfo == null) {  // 本次 remove 没找到（例如已被 removeAbandoned 移走），打 warn 便于排查
                 if (LOG.isWarnEnabled()) {
                     LOG.warn("remove abandoned failed. activeConnections.size " + activeConnections.size());
                 }
             }
         }
 
+        // 是否事务自动提交
         final boolean isAutoCommit = holder.underlyingAutoCommit;
+        // 是否只读
         final boolean isReadOnly = holder.underlyingReadOnly;
+        // 归还是否校验
         final boolean testOnReturn = this.testOnReturn;
 
         try {
+            // 未自动提交且非只读时 rollback，避免未提交事务占用连接状态
             // check need to rollback?
             if ((!isAutoCommit) && (!isReadOnly)) {
                 pooledConnection.rollback();
             }
 
+            // 恢复默认设置、清缓存、清 Warnings 等，使连接回到“可再次借出”的干净状态。跨线程时先拿连接自己的 lock 再 reset，避免与业务线程同时操作同一连接。
             // reset holder, restore default settings, clear warnings
             if (!isSameThread) {
                 final ReentrantLock lock = pooledConnection.lock;
@@ -2208,16 +2222,21 @@ public class DruidDataSource extends DruidAbstractDataSource
                 holder.reset();
             }
 
+            // 该连接已被别处标记为废弃（如借出校验失败、异常路径），不再回池，直接 return（池化连接侧会在 recycle() 里清空 holder/conn/closed）
             if (holder.discard) {
                 return;
             }
 
+            // 物理连接最大复用次数，达到则丢弃并 discardConnection，促新连接替换
+            // 数据源用户名/密码变更后，旧连接不再回池，discardConnection 后 return
             if ((phyMaxUseCount > 0 && holder.useCount >= phyMaxUseCount)
                     || holder.userPasswordVersion < getUserPasswordVersion()) {
                 discardConnection(holder);
                 return;
             }
 
+            // 物理连接已关闭
+            // 底层连接已被关闭（如被服务端踢掉、超时），不能再放入池。只做 activeCount--、closeCount++，不 putLast，不再次关闭（避免重复关）
             if (physicalConnection.isClosed()) {
                 lock.lock();
                 try {
@@ -2232,6 +2251,7 @@ public class DruidDataSource extends DruidAbstractDataSource
                 return;
             }
 
+            // 若开启 testOnReturn，归还前做一次有效性检测；不通过则物理关闭、更新 destroyCount/activeCount/closeCount，不回池
             if (testOnReturn) {
                 boolean validated = testConnectionInternal(holder, physicalConnection);
                 if (!validated) {
@@ -2252,11 +2272,13 @@ public class DruidDataSource extends DruidAbstractDataSource
                     return;
                 }
             }
+            // 若借出时记录了初始 schema，归还时恢复并清空字段
             if (holder.initSchema != null) {
                 holder.conn.setSchema(holder.initSchema);
                 holder.initSchema = null;
             }
 
+            // 数据源已禁用，不再回池，discardConnection 后 return
             if (!enable) {
                 discardConnection(holder);
                 return;
@@ -2265,6 +2287,7 @@ public class DruidDataSource extends DruidAbstractDataSource
             boolean result;
             final long currentTimeMillis = System.currentTimeMillis();
 
+            // 物理连接存活超过该时间则不再回池，discardConnection 后 return
             if (phyTimeoutMillis > 0) {
                 long phyConnectTimeMillis = currentTimeMillis - holder.connectTimeMillis;
                 if (phyConnectTimeMillis > phyTimeoutMillis) {
@@ -2273,41 +2296,66 @@ public class DruidDataSource extends DruidAbstractDataSource
                 }
             }
 
+            // 回池，在已经做完 rollback、reset、各种“不能回池”的检查之后，把这条连接正式从借出变为空闲
+
+            // 先假设“不是因池满而失败”，后面若 putLast 失败再根据当前池状态设 full，用于日志里区分“池满”和“已关闭/discard”等。
             boolean full = false;
+            // 拿数据源主锁，和 getConnectionInternal、pollLast、putLast、discardConnection 等共用，保证 activeCount、connections、poolingCount 的读写是原子的。
             lock.lock();
             try {
+                // 只有这条连接当前仍被算作“借出”（active 为 true）时才减 activeCount。正常情况下从池借出时会把 holder.active=true，所以归还时这里会成立；若前面某分支已把 active 置 false 或未置过，这里不会重复减。
                 if (holder.active) {
+                    // “当前被借出的连接数”减 1，与 getConnection 时的 activeCount++ 对应，保证池的计数正确。
                     activeCount--;
+                    // 标记该 holder 已不再被借出，避免后续逻辑或统计仍把它当活跃连接
                     holder.active = false;
                 }
+                // 统计“业务调 close 的次数”（逻辑关闭次数），与 connectCount 对应，用于监控/健康检查
                 closeCount++;
 
+                // 回池
                 result = putLast(holder, currentTimeMillis);
+                // 回归数量 + 1
                 recycleCount++;
+
+                // putLast 失败时，用 poolingCount + activeCount >= maxActive 判断是否“池已满”。
+                // full 为 true 表示很可能是因池满导致 putLast 拒绝；为 false 表示更可能是 closed、closing 或 holder.discard 等。
                 if (!result) {
                     full = poolingCount + activeCount >= maxActive;
                 }
             } finally {
+                // 无论 try 里是否抛异常、putLast 成功与否，都释放主锁，避免死锁
                 lock.unlock();
             }
 
+            // putLast 返回 false：池已满、或数据源已关闭/正在关闭、或 holder 已被标记 discard 等，连接没能放进 connections。
             if (!result) {
+                // 既然不能回池，就不能再留着这条物理连接，否则会泄漏；所以这里关闭底层 JDBC Connection，释放 DB 端资源。
+                // 注意：前面在锁内已经做了 activeCount--、closeCount++、recycleCount++，这里不再改计数，只做物理关闭。
                 JdbcUtils.close(holder.conn);
                 String msg = "connection recycle failed.";
+                // 若前面算出 full 为 true，在日志里标明是“池满”导致回收失败，便于和“数据源关闭”等其它原因区分
                 if (full) {
                     msg += " pool is full";
                 }
                 LOG.info(msg);
             }
         } catch (Throwable e) {
+            // 清空该 holder 上的语句缓存，避免异常状态下带着脏缓存再被复用或关闭时出问题
             holder.clearStatementCache();
 
+            // 若该 holder 尚未被标记为废弃，才执行丢弃逻辑；避免重复 discard、重复 activeCount-- 等
             if (!holder.discard) {
+                // 理关闭 Connection（及 socket），持主锁下：若 holder.active
+                // 则 activeCount--、holder.active=false，discardCount++，holder.discard=true，并在池低于 minIdle 时 emptySignal 触发补连。
+                // 保证这条连接从池的“逻辑”和“物理”上都移除，且计数正确
                 discardConnection(holder);
+                // 标记该 holder 已废弃，后续若再遇到该 holder（如重复调用）不会再重复 discard 或回池。
                 holder.discard = true;
             }
 
             LOG.error("recycle error", e);
+            // 记录回收异常和次数，便于发现 DB 异常、网络问题、配置问题等。
             recycleErrorCountUpdater.incrementAndGet(this);
         }
     }
@@ -2447,6 +2495,15 @@ public class DruidDataSource extends DruidAbstractDataSource
         return mbeanRegistered;
     }
 
+    /**
+     * 回池
+     * 作用：在已持锁的前提下把 holder 放入 connections[poolingCount]，poolingCount++，更新 lastActiveTimeMillis、poolingPeak，
+     * 并 notEmpty.signal() 唤醒一个在 pollLast 里等连接的线程。putLast 内部会再判断：
+     * 池已满(activeCount+poolingCount>=maxActive)、holder.discard、closed、closing 等会直接返回 false，不放进去
+     * @param e
+     * @param lastActiveTimeMillis
+     * @return
+     */
     boolean putLast(DruidConnectionHolder e, long lastActiveTimeMillis) {
         if (activeCount + poolingCount >= maxActive || e.discard || this.closed || this.closing) {
             return false;
