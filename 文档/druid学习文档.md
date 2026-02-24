@@ -227,13 +227,14 @@ try {
     subgraph "获取数据库连接"
         OP1_1["保证获取连接时数据源已初始化: init();"]
         C1_2{"Filter链数量 > 0"}
-        OP1_3["DruidDataSource#getConnectionDirect;直接获取数据库连接"]
-        OP1_4["结束"]
-        
+        OP1_3["DruidDataSource.getConnectionDirect;直接获取数据库连接"]
     end
 
     subgraph 直接获取数据库连接
-        OP2_1["保证获取连接时数据源已初始化: init();"]
+        subgraph "for循环,直到获取合法连接"
+            OP2_1["DruidDataSource.getConnectionInternal;获取DruidPooledConnection，以及失败后重试"]
+            OP2_2["借出校验与泄漏追踪"]
+        end
     end
 
     subgraph "通过Filter链获取数据库连接"
@@ -246,11 +247,12 @@ try {
     end
 
     OP1_1 --> C1_2
-     C1_2 --> |N| OP1_3
-     OP1_3 --> OP1_4
+    C1_2 --> |N| OP1_3
     
 
     OP1_3 -.- 直接获取数据库连接
+
+    OP2_1 --> OP2_2
     
 
     C1_2 --> |Y| OP3_1

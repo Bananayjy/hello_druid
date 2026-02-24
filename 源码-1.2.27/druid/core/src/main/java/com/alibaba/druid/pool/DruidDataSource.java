@@ -1527,66 +1527,89 @@ public class DruidDataSource extends DruidAbstractDataSource
                 throw ex;
             }
 
-            // 借出校验: testOnBorrow / testWhileIdle / isClosed 校验，不合格则 discardConnection + continue
-            if (testOnBorrow) {
+            /**
+             * 借出校验
+             * 目标：保证借出去的连接是可用、未关闭的，必要时做空闲时间 + 有效性校验；不合格则 discardConnection + continue
+             * 校验：
+             * 1.testOnBorrow校验：每次借出都做一次有效性校验；不通过就丢弃并 continue
+             * 2.testWhileIdle校验：对在池里空闲了较长时间（或保活/执行时间较久未更新）的连接，在借出时做一次有效性校验
+             * 3.isClosed校验：连接是否已经被关闭”的校验
+             */
+            if (testOnBorrow) { // testOnBorrow校验
                 // 用 ValidConnectionChecker 或 validationQuery 校验连接是否还有效
                 boolean validated = testConnectionInternal(poolableConnection.holder, poolableConnection.conn);
-                // discardConnection(holder)（物理关闭、从池计数中移除、必要时 emptySignal 触发补连），然后 continue，再循环取下一根连接。
+                // 不通过：认为连接已坏（网络断、DB 重启、连接被服务端踢掉等）
                 if (!validated) {
+                    // 日志打印
                     if (LOG.isDebugEnabled()) {
                         LOG.debug("skip not validated connection.");
                     }
 
-                    // 物理关闭、从池计数中移除、必要时 emptySignal 触发补连
+                    // discardConnection(holder)（物理关闭、从池移除、必要时 emptySignal 补连）
                     discardConnection(poolableConnection.holder);
+                    // 循环取下一个连接
                     continue;
                 }
             } else {
-                // 查看连接是否已经关闭
+                // isClosed校验，查看连接是否已经关闭
                 if (poolableConnection.conn.isClosed()) {
-                    // 物理关闭、从池计数中移除、必要时 emptySignal 触发补连
+                    // discardConnection(holder)（物理关闭、从池移除、必要时 emptySignal 补连）
                     discardConnection(poolableConnection.holder); // 传入null，避免重复关闭
+                    // 循环取下一个连接
                     continue;
                 }
 
                 // 对“空闲够久”的连接在借出时做一次校验，坏连接丢弃并重试
                 if (testWhileIdle) {
                     final DruidConnectionHolder holder = poolableConnection.holder;
+                    // 当前时间
                     long currentTimeMillis = System.currentTimeMillis();
+                    // 上次被业务使用（借出/归还）的时间
                     long lastActiveTimeMillis = holder.lastActiveTimeMillis;
+                    // 上次执行 SQL 的时间
                     long lastExecTimeMillis = holder.lastExecTimeMillis;
+                    // 上次保活（keepAlive）检测通过的时间
                     long lastKeepTimeMillis = holder.lastKeepTimeMillis;
 
+                    // 若配置了“用执行时间代替活跃时间”，则用 lastExecTimeMillis
                     if (checkExecuteTime
                             && lastExecTimeMillis != lastActiveTimeMillis) {
                         lastActiveTimeMillis = lastExecTimeMillis;
                     }
 
+                    // 保活时间更晚则用保活时间，表示“最近一次证明连接还活着的时刻”
                     if (lastKeepTimeMillis > lastActiveTimeMillis) {
                         lastActiveTimeMillis = lastKeepTimeMillis;
                     }
 
+                    // 空闲时间 = 当前时间 - 上次被业务使用（借出/归还）的时间
                     long idleMillis = currentTimeMillis - lastActiveTimeMillis;
 
+                    // 空闲时间 >=  eviction 间隔，或异常为负，才做校验
                     if (idleMillis >= timeBetweenEvictionRunsMillis
                             || idleMillis < 0 // unexcepted branch
                     ) {
+                        // 用 ValidConnectionChecker 或 validationQuery 校验连接是否还有效
                         boolean validated = testConnectionInternal(poolableConnection.holder, poolableConnection.conn);
+                        // 不通过：认为连接已坏（网络断、DB 重启、连接被服务端踢掉等）
                         if (!validated) {
                             if (LOG.isDebugEnabled()) {
                                 LOG.debug("skip not validated connection.");
                             }
-                            // 物理关闭、从池计数中移除、必要时 emptySignal 触发补连
+                            // discardConnection(holder)（物理关闭、从池移除、必要时 emptySignal 补连）
                             discardConnection(poolableConnection.holder);
+                            // 循环取下一个连接
                             continue;
                         }
                     }
                 }
             }
 
-            // 对本次借出的连接做泄漏追踪
-            // 在“借出”这一刻就为泄漏检测准备好了栈和时间，后面归还时会从 activeConnections 移除并清理 trace
-            // removeAbandoned 时记录栈、时间并加入 activeConnections
+            /**
+             * 泄漏追踪，对本次借出的连接做泄漏追踪
+             * 在“借出”这一刻就为泄漏检测准备好了栈和时间，后面归还时会从 activeConnections 移除并清理 trace
+             * removeAbandoned 时记录栈、时间并加入 activeConnections
+             */
             if (removeAbandoned) {
                 StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
                 // 当前线程的调用栈，便于后续看到“是谁借走了连接没还”
