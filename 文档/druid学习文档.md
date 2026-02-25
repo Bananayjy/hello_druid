@@ -98,7 +98,7 @@
      
 ```
 
-#### 1.DruidDriver.getInstance() 防死锁
+#### 1.1、DruidDriver.getInstance防死锁
 
 下面分几部分说明 **DruidDriver.getInstance()** 的作用和为什么在 `init()` 里要提前调用。
 
@@ -199,6 +199,47 @@ try {
 
 
 
+#### 1.2、netTimeoutExecutor的作用
+
+首先要讲解一下Connection的setNetworkTimeout方法
+
+```
+void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException;
+```
+
+用来给这条 Connection（以及从它创建的 Statement、ResultSet 等）设置网络超时：在最多等待数据库响应 milliseconds 毫秒，超时后驱动要中断等待、做清理等。第一个参数 executor：驱动在“发生超时”或“执行与超时相关的逻辑”时，用这个 Executor 来跑这些逻辑，而不是驱动自己随便起线程，也就是说：第一个参数的作用 = 告诉驱动：“超时发生时，你要执行的回调/任务，用我提供的这个 Executor 来执行”。第二个参数 milliseconds：超时时间（毫秒），0 表示不限制。第二个参数 milliseconds：超时时间（毫秒），0 表示不限制。
+
+为什么 JDBC 要传 Executor 而不是驱动自己起线程？
+
+超时到时，驱动通常要做的事包括：中断当前阻塞的 socket 读、取消操作、关闭或标记连接等，这些都要在某个线程里执行。若由驱动自己内部起线程（例如每个连接一个定时器线程），会带来：应用无法控制线程数量、线程名、优先级；大量连接时线程过多；与应用的线程池、监控、优雅关闭策略不一致。
+
+所以 JDBC 规范把“谁来执行超时相关逻辑”交给调用方：调用方传一个 Executor，驱动在需要执行超时处理时，只做 executor.execute(runnable)，不自己起线程。这样：应用可以传“当前线程同步执行”的 Executor（像 Druid 的 SynchronousExecutor）；也可以传自己的线程池，统一管控线程和资源。
+
+durid传的netTimeoutExecutor的实现如下所示：
+
+```java
+/**
+ * 同步执行器
+ */
+class SynchronousExecutor implements Executor {
+    @Override
+    public void execute(Runnable command) {
+        try {
+            // 直接在当前线程执行，不另起线程
+            command.run();
+        } catch (AbstractMethodError error) {
+            //  // 标记驱动不支持 setNetworkTimeout，后续不再尝试
+            netTimeoutError = true;
+        } catch (Exception ignored) {
+            // 打印异常日志
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("failed to execute command " + command);
+            }
+        }
+    }
+}
+```
+
 
 
 ### 2、获取连接
@@ -206,7 +247,7 @@ try {
 相关类：
 
 - com.alibaba.druid.pool.DruidDataSource#getConnection(long)：获取连接（直接建连，从池中获取）
-- CreateConnectionThread：向池中补连
+- com.alibaba.druid.pool.DruidDataSource.CreateConnectionThread：建连线程，向池中补连
 
 ![mermaid-diagram-2026-02-24-121951](Y:\香蕉宝宝\Do\数据库相关\hello_druid\文档\druid学习文档.assets\mermaid-diagram-2026-02-24-121951.png)
 
