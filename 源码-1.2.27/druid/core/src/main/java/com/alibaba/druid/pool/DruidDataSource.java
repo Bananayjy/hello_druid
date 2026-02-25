@@ -918,10 +918,8 @@ public class DruidDataSource extends DruidAbstractDataSource
 
             /**
              * 注册Mbean
-             * 把当前 DruidDataSource 注册到 JMX，并记下它在 JMX 里的名字（ObjectName）
-             * 暴露到 JMX，便于监控和运维
-             * 纳入 Druid 统一统计与监控
-             * 与 close 时的 unregister 成对，保证生命周期正确、不泄漏
+             * 作用：把当前 DruidDataSource 实例注册到 JVM 的 JMX（Java Management Extensions）中，使该数据源可以通过 JMX 被监控、查询统计、执行管理操作（如 shrink、resetStat 等）
+             * 注册完成后会记录对应的 ObjectName 并设置 mbeanRegistered = true，与 close() 时的 unregisterMbean() 成对，保证生命周期正确、不泄漏。
              */
             registerMbean();
 
@@ -2462,7 +2460,9 @@ public class DruidDataSource extends DruidAbstractDataSource
     }
 
     public void registerMbean() {
+        // 仅当 mbeanRegistered == false 时才执行注册
         if (!mbeanRegistered) {
+            // 在 AccessController.doPrivileged 中执行，避免调用方没有 JMX 权限导致注册失
             AccessController.doPrivileged(new PrivilegedAction<Object>() {
                 @Override
                 public Object run() {

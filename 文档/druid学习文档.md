@@ -98,106 +98,11 @@
      
 ```
 
+
+
 #### 1.1、DruidDriver.getInstance防死锁
 
-下面分几部分说明 **DruidDriver.getInstance()** 的作用和为什么在 `init()` 里要提前调用。
-
-一、方法本身在做什么
-
-```java
-// DruidDriver.java
-private static final DruidDriver instance = new DruidDriver();
-
-public static DruidDriver getInstance() {
-    return instance;
-}
-```
-
-- **代码含义**：就是一个典型的单例 getter，返回静态常量 **instance**。
-- **实际效果**：要执行 `getInstance()`，JVM 必须先完成 **DruidDriver 类的初始化**（还没加载、初始化过的话，会先加载并执行静态初始化），然后才能读 `instance`。  
-所以“调用 getInstance()”的真实意义是：**触发 DruidDriver 的类加载与静态初始化**。
-
-二、DruidDriver 的静态初始化做了什么
-
-```java
-static {
-    AccessController.doPrivileged(new PrivilegedAction<Object>() {
-        @Override
-        public Object run() {
-            registerDriver(instance);
-            return null;
-        }
-    });
-}
-
-public static boolean registerDriver(Driver driver) {
-    try {
-        DriverManager.registerDriver(driver);   // ① 向 JDBC 注册驱动
-        // ② 可选：向 JMX 注册 MBean
-        MBeanServer mbeanServer = ManagementFactory.getPlatformMBeanServer();
-        ObjectName objectName = new ObjectName(MBEAN_NAME);
-        if (!mbeanServer.isRegistered(objectName)) {
-            mbeanServer.registerMBean(instance, objectName);
-        }
-        return true;
-    } catch (Exception e) { ... }
-    return false;
-}
-```
-
-也就是说，**第一次加载 DruidDriver 类时会**：
-
-1. 执行 **DriverManager.registerDriver(instance)**，把 DruidDriver 注册成 JDBC 驱动（内部会拿 **DriverManager 的锁**）。
-2. 可能再执行 **MBeanServer.registerMBean(...)**（也可能再涉及 JMX 的锁）。
-
-因此：**DruidDriver 的类初始化会获取“DriverManager（以及可能 JMX）的锁”**。
-
-三、DruidDriver 在整体里扮演什么角色
-
-- **DruidDriver** 实现了 **java.sql.Driver**，用来支持 **“包装型 JDBC URL”** 的用法：
-  - URL 以 **jdbc:wrap-jdbc:** 开头时，由 DruidDriver 接受；
-  - 它会解析 URL（driver、filters、name 等），创建或复用 **DataSourceProxyImpl**，再通过 `dataSource.connect(info)` 得到 Connection。
-- 也就是说：**DriverManager.getConnection("jdbc:wrap-jdbc:...")** 会走到 DruidDriver，这是另一种使用 Druid 的方式，和直接使用 **DruidDataSource** 是两条路径。
-- **DruidDataSource** 自己建连时用的是 **真实 Driver**（如 MySQL Driver），一般不会用 DruidDriver 去建连；但 **DruidDataSource.init()** 里会调用 **DruidDriver.createDataSourceId()** 来生成数据源 ID，所以会**依赖 DruidDriver 类**。
-
-四、为什么要在 init() 里“提前”调用 getInstance()（防死锁 #2980）
-
-在 **DruidDataSource.init()** 里，顺序是：
-
-```java
-DruidDriver.getInstance();   // ① 先执行
-
-final ReentrantLock lock = this.lock;
-lock.lockInterruptibly();    // ② 再加锁
-try {
-    // ...
-    this.id = DruidDriver.createDataSourceId();  // ③ 后面才会用到 DruidDriver
-    // ...
-}
-```
-
-若**不**在 ② 之前调用 ①，可能出现：
-
-- **线程 A**：已持有 **DruidDataSource 的 lock**，在 init() 里执行到 **DruidDriver.createDataSourceId()**（或其它第一次引用 DruidDriver 的地方）→ 触发 **DruidDriver 类加载** → 静态块里执行 **DriverManager.registerDriver()** → 需要去拿 **DriverManager 的锁**。
-- **线程 B**：在别处（例如其它地方加载/注册驱动）已持有 **DriverManager 的锁**，随后某次操作又需要 **DruidDataSource 的 lock**（例如另一个数据源 init、或 getConnection 等）。
-- 结果：A 拿 DataSource 锁等 DriverManager 锁，B 拿 DriverManager 锁等 DataSource 锁 → **死锁**。
-
-通过在 **加 DruidDataSource 的 lock 之前**先执行 **DruidDriver.getInstance()**：
-
-- 在**尚未持有任何 DataSource 锁**的时候，就完成 **DruidDriver 的类加载**；
-- 类加载时该拿的 **DriverManager（和 JMX）的锁**，都在此时拿完、放完；
-- 之后再 **lock.lockInterruptibly()**，之后再用到 **DruidDriver.createDataSourceId()** 时，只是调用已加载类的方法，**不会再触发类初始化**，也就不会在持锁状态下再去抢 DriverManager 的锁。
-
-这样就把“加载 DruidDriver / 注册驱动”和“持有 DruidDataSource 锁”在时间上分开，**避免形成 2980 里那种死锁**。
-
-五、小结（一句话 + 分层说明）
-
-- **getInstance() 本身**：只是返回单例 `instance`，但会**触发 DruidDriver 的类加载与静态初始化**。
-- **静态初始化的作用**：向 **DriverManager** 注册 DruidDriver，并可选注册 **JMX MBean**；这些动作会涉及系统锁（DriverManager 等）。
-- **在 init() 里提前调用的意义**：在 **DruidDataSource 尚未加锁** 时就把 DruidDriver 加载完、注册完，避免在**已持 DataSource 锁**的情况下再去触发 DriverManager 的锁，从而**防止 issue #2980 的 dead lock**。
-- **对“直接用 DruidDataSource”的用法**：建连仍用真实 JDBC 驱动；DruidDriver 在这里主要是为了**提前完成类加载和注册**，而不是为了用它的 `connect()`。
-
-
+详情见issue：https://github.com/alibaba/druid/issues/2980
 
 #### 1.2、netTimeoutExecutor的作用
 
@@ -215,7 +120,7 @@ void setNetworkTimeout(Executor executor, int milliseconds) throws SQLException;
 
 所以 JDBC 规范把“谁来执行超时相关逻辑”交给调用方：调用方传一个 Executor，驱动在需要执行超时处理时，只做 executor.execute(runnable)，不自己起线程。这样：应用可以传“当前线程同步执行”的 Executor（像 Druid 的 SynchronousExecutor）；也可以传自己的线程池，统一管控线程和资源。
 
-durid传的netTimeoutExecutor的实现如下所示：
+durid中的netTimeoutExecutor对应的实现类如下所示：
 
 ```java
 /**
@@ -239,6 +144,10 @@ class SynchronousExecutor implements Executor {
     }
 }
 ```
+
+execute(command) 里直接 command.run()，不新起线程、不提交到线程池。超时相关逻辑由驱动在“驱动自己的超时机制所在的线程”里同步执行，Druid 不额外引入线程，也不关心这些逻辑具体在哪个线程跑，只要满足 JDBC 必须传一个 Executor 的要求即可。
+
+
 
 
 
@@ -318,13 +227,11 @@ class SynchronousExecutor implements Executor {
 
 
 
-详解：
-
-1、为什么这个链要设计成既要拿，又要还
+#### 2.1、为什么Filter链要设计成既要拿，又要还
 
 “拿”是为了从缓存里取一条可用的链（没有再 new），“还”是把用过的链 reset 后放回缓存，供下次 getConnection 复用，从而在高并发下少 new、少 GC；链是有状态的，所以必须 reset 再还，不能只拿不还。
 
-2、关于建连线程的唤醒、调度
+#### 2.2、关于建连线程的唤醒、调度
 
 Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 里创建）：
 
@@ -621,10 +528,6 @@ flowchart TD
 
 
 
-
-
-
-
 ## 📖 参考文档
 
 - 官方文档：https://github.com/alibaba/druid/wiki/%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98
@@ -632,6 +535,8 @@ flowchart TD
 - https://www.cnblogs.com/jingzh/p/16216411.html#13-%E9%85%8D%E7%BD%AE%E7%9B%B8%E5%85%B3%E5%B1%9E%E6%80%A7
 
 - https://juejin.cn/post/7408147106891235355
+
+- JMX：https://blog.csdn.net/zhangzehai2234/article/details/135299917
 
 
 
