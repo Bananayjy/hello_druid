@@ -398,6 +398,90 @@ Druid 用同一把锁 lock 绑了两个 Condition（在 DruidAbstractDataSource 
 
 相关类：com.alibaba.druid.pool.DruidPooledConnection#close
 
+![mermaid-diagram-2026-02-25-121926](Y:\香蕉宝宝\Do\数据库相关\hello_druid\文档\druid学习文档.assets\mermaid-diagram-2026-02-25-121926.png)
+
+```
+flowchart TD
+    subgraph close["DruidPooledConnection.close"]
+        direction TB
+        C0["close 入口"]
+        C1["判断当前连接是否已经关闭，避免重复关闭"]
+        C2["获取连接持有者对象，如果持有者对象为空，则直接return，并根据配置打印日志"]
+        C3["从连接持有者对象中获取当前数据源"]
+        C7{"当前关闭线程是否和获取线程相同"}
+        C8["设置asyncCloseConnectionEnable为true"]
+        C9{"removeAbandoned 或 asyncCloseConnectionEnable为ture"}
+        C10["同步关闭连接syncClose并return，和下述关闭流程类似，只不过对操作加锁"]
+        C11{"CLOSING_UPDATER.compareAndSet(0,1)<br/>失败?"}
+        C12["return，其他线程正在关闭"]
+        C13["遍历监听器进行通知"]
+        C14{"filtersSize > 0：存在链"}
+        C15["链关闭逻辑，和链获取连接逻辑类似，递归再返回"]
+        C16["recycle()"]
+        C17["finally: CLOSING_UPDATER.set(0)"]
+        C18["设置当前连接关闭状态为true：this.disable = true"]
+    end
+
+    C0 --> C1
+    C1 --> C2
+    C2 --> C3
+    C3 --> C7
+    C7 -->|否| C8
+    C7 -->|是| C9
+    C8 --> C9
+    C9 -->|是| C10
+    C9 -->|否| C11
+    C11 -->|是| C12
+    C11 -->|否| C13
+    C13 --> C14
+    C14 -->|是| C15
+    C14 -->|否| C16
+    C15 --> C16
+    C16 --> C17
+    C17 --> C18
+
+    C16 -.- recycle
+
+    subgraph recycle["DruidPooledConnection.recycle"]
+        direction TB
+        RECYCLE_ENTRY["recycle 入口"]
+        R1["判断当前连接是否已经关闭，避免重复关闭"]
+        R2["获取连接持有者对象，如果持有者对象为空，则直接return，并根据配置打印日志"]
+        R6{"!this.abandoned?：只有未被标记为“泄漏回收”的才调数据源回收；"}
+        R7["holder.dataSource.recycle(this)"]
+        R8["无论是否调了 dataSource.recycle，都与连接解耦并标记已关闭，保证状态一致：<br/>this.holder = null<br/>conn = null<br/>transactionInfo = null<br/>closed = true"]
+    end
+
+    RECYCLE_ENTRY --> R1
+    R1 --> R2
+    R2 --> R6
+    R6 -->|是| R7
+    R6 -->|否| R8
+    R7 --> R8
+
+    R7 -.- ds_recycle
+
+    subgraph ds_recycle["DruidDataSource.recycle (数据源回收)"]
+        direction TB
+        DS_RECYCLE["recycle(pooledConnection) 入口"]
+        D1["traceEnable: activeConnections.remove"]
+        D2["!isAutoCommit 且 !isReadOnly: rollback"]
+        D3["holder.reset()<br/>跨线程时先拿连接 lock"]
+        D4["discard/phyMaxUseCount/已关闭/testOnReturn/!enable/物理超时 等则 discardConnection 或 return"]
+        D5["lock: activeCount--, closeCount++<br/>putLast(holder) 回池"]
+        D6["putLast 失败: JdbcUtils.close(holder.conn)"]
+        D7["异常: clearStatementCache, discardConnection"]
+    end
+
+    DS_RECYCLE --> D1
+    D1 --> D2
+    D2 --> D3
+    D3 --> D4
+    D4 --> D5
+    D5 --> D6
+    D5 --> D7
+```
+
 
 
 

@@ -43,7 +43,9 @@ import java.util.concurrent.locks.ReentrantLock;
 public class DruidPooledConnection extends PoolableWrapper implements javax.sql.PooledConnection, Connection {
     private static final Log LOG = LogFactory.getLog(DruidPooledConnection.class);
     public static final int MAX_RECORD_SQL_COUNT = 10;
+    // 物理连接
     protected Connection conn;
+    // 当前连接持有者信息
     protected volatile DruidConnectionHolder holder;
     protected TransactionInfo transactionInfo;
     private final boolean dupCloseLogEnable;
@@ -264,12 +266,18 @@ public class DruidPooledConnection extends PoolableWrapper implements javax.sql.
 
         /**
          * 跨线程close，需要加锁，和下面逻辑一样，只不过加了连接自己的lock锁，避免在 removeAbandoned 或跨线程 close 时，出现“连接已被回池但原持有者还在用”的并发问题
-         * 加锁意义：这里的锁是连接自己的 lock（和 holder 共用），和 getStatement、execute 等“使用这条连接”的操作用的是同一把锁
+         *
+         * 1.加锁意义
+         * 这里的锁是连接自己的 lock（和 holder 共用），和 getStatement、execute 等“使用这条连接”的操作用的是同一把锁
          * 无锁路径只保证了：多条线程同时 close 同一条连接 时，只有一条能 CAS 成功并执行 recycle，其它线程静默返回，不会重复 putLast、重复 activeCount--。
          * 它没有保证：“正在用这条连接的线程” 和 “正在 close 这条连接的线程” 之间的互斥。（保证多个线程close时候的互斥，没有保证其他使用这个连接操作和close操作的互斥）
          * 持锁路径（syncClose） 保证：从 lock.lock() 到 lock.unlock() 之间，只有这一条线程 能执行“关闭 + 回收”；其它任何要使用这条连接的操作（例如在同一条连接上 getStatement、execute），
          * 也需要这把锁，因此要么在 close 之前做完，要么等 close 做完再做。
          * 也就是说：“关这条连接”和“用这条连接”被串行化了。
+         * 2.为什么要这么设计
+         * 可以去掉分支、统一成每次都走 syncClose（或等价持锁逻辑），功能仍然正确
+         * 规范用法（同线程、未开 removeAbandoned）走无锁路径，减少开销、减少锁竞争、避免多数 close 参与“connection → dataSource”的锁顺序；非规范或高风险用法走 syncClose，用锁保证“关”与“用”的互斥和状态一致
+         *
          */
         if (dataSource.removeAbandoned || dataSource.asyncCloseConnectionEnable) {
             syncClose();
